@@ -176,7 +176,6 @@ and non-deterministic; the default rules engine is the one to demo with.
 
 ```
 MVP/
-├── PLAN.md               how this was built, phase by phase
 ├── README.md             this file
 ├── run_pipeline.py       the whole pipeline, one command
 ├── app.py                the Streamlit demo — six tabs
