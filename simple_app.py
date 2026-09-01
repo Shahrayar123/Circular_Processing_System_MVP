@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mvp import config, review, store  # noqa: E402
 
-st.set_page_config(page_title="Audit Checklist — Proposed Changes",
+st.set_page_config(page_title="Circular Processing System",
                    page_icon="✅", layout="wide")
 
 COLOUR = {"New": "#2E7A4F", "Amendment": "#9C6F11", "Deletion": "#B03A30",
@@ -119,7 +119,7 @@ def counts_line() -> None:
 # ====== PAGE ======
 
 st.markdown(
-    "<h2 style='margin-bottom:2px'>Audit Checklist — Proposed Changes</h2>"
+    "<h2 style='margin-bottom:2px'>Circular Processing System - MVP</h2>"
     "<p style='color:#64757A;margin-top:0;font-size:15px'>"
     "Changes proposed from this week's circulars. Reviewer signs off, then approver, "
     "then the Excel file is released.</p>",
