@@ -1,0 +1,11 @@
+BPRD CIRCULAR NO. 44 OF 2026
+CONTROLS OVER PRIVILEGED SYSTEM ACCESS
+
+1. All banks shall maintain a register of privileged system accounts and shall review it
+on a monthly basis. Evidence of the review shall be retained for inspection.
+
+2. Privileged accounts that remain inactive for ninety days shall be disabled
+automatically by the system.
+
+3. Instructions contained in Circular Letter No. 08 of 2021 relating to quarterly review
+of privileged accounts shall stand withdrawn.

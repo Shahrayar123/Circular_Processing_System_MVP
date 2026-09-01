@@ -1,0 +1,46 @@
+# AuditPilot MVP — the demonstration only.
+#
+# This is NOT the delivered system's requirements file. The MVP runs on a laptop with
+# no GPU, no database server and no model downloads: SQLite instead of PostgreSQL,
+# TF-IDF vectors instead of BGE embeddings, deterministic rules instead of a 72B model.
+#
+#     pip install -r requirements.txt
+#     python run_pipeline.py
+#     streamlit run poc_app.py
+#
+# Python 3.10 or newer.
+
+# ====== CORE — the demo will not run without these ======
+
+streamlit==1.41.1           # both UIs: app.py (full) and poc_app.py (simple)
+pandas==2.2.3               # tables in the UI
+numpy==2.2.1                # the TF-IDF vectors and cosine similarity
+rank-bm25==0.2.2            # the keyword half of retrieval
+
+# Reading circulars
+pypdf==5.1.0                # PDF text layer, page count
+python-docx==1.1.2          # Word in (clauses) and Word out (working document)
+openpyxl==3.1.5             # Excel in (annexures) and Excel out (working file, eAudit)
+
+# ====== OCR — scanned PDFs and images ======
+# Needed only for scanned material. Both packages are thin wrappers: they also require
+# the TESSERACT and POPPLER binaries to be installed on the machine, which pip cannot
+# do. Without them the demo still runs — a scanned page is recorded with its reason
+# rather than silently dropped.
+#   Windows:  choco install tesseract poppler
+#   Ubuntu:   sudo apt install tesseract-ocr poppler-utils
+
+pytesseract==0.3.13         # Tesseract 5 wrapper
+pdf2image==1.17.0           # renders a scanned PDF page to an image for OCR
+pillow==11.0.0              # image handling for the above
+
+# ====== OPTIONAL — each degrades gracefully if absent ======
+# Every one of these is imported inside a try/except. Leave them out and the demo
+# still runs; the affected file type is recorded as unreadable with the reason.
+
+# extract-msg==0.53.1       # Outlook .msg files from the RIA mailbox
+# python-pptx==1.0.2        # PowerPoint circular annexures
+# httpx==0.28.1             # only for `run_pipeline.py --engine ollama`
+
+# Legacy .doc / .xls / .ppt are converted with LIBREOFFICE, which is not a pip
+# package — install it separately if those formats are in scope for the demo.
