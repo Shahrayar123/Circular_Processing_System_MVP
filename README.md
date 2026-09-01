@@ -1,9 +1,4 @@
-# AuditPilot MVP
-
-A working demonstration of the audit-checklist process, running on ABL's own documents.
-Built to show what the system does and what it produces — **not** the delivered system.
-
-The real build is prompted in `../For Live Work/` and is untouched by anything here.
+# Circular Processing System MVP
 
 ---
 
