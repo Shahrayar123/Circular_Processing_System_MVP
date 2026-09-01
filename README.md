@@ -201,3 +201,4 @@ MVP/
 
 Delete `mvp_demo.db` and `output/`, then run the pipeline again. Everything is rebuilt
 from the documents and the generator — nothing is hand-maintained.
+
