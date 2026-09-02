@@ -112,6 +112,26 @@ def init(reset: bool = False) -> None:
         conn.executescript(SCHEMA)
 
 
+def ready() -> bool:
+    """True only when the demo database has actually been BUILT.
+
+    Checking that the file exists is not enough. SQLite creates the file the moment
+    anything connects to it, so one stray query before `run_pipeline.py` has ever run
+    leaves a real but table-less database behind. From then on a file-existence check
+    passes and every query fails with "no such table: audit_tests" — which tells a new
+    user nothing about what they actually need to do.
+    """
+    if not Path(config.DB_PATH).exists():
+        return False
+    try:
+        with connect() as conn:
+            return conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'audit_tests'").fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
 def insert(conn: sqlite3.Connection, table: str, row: dict) -> int:
     keys = list(row)
     placeholders = ", ".join("?" for _ in keys)
