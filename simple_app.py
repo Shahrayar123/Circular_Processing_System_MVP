@@ -125,10 +125,15 @@ st.markdown(
     "then the Excel file is released.</p>",
     unsafe_allow_html=True)
 
-if not Path(config.DB_PATH).exists():
-    st.error("No data yet.")
+# store.ready() checks that the TABLES exist, not just the file — SQLite creates an
+# empty file on any connection, and a file-only check turns a "run the pipeline first"
+# message into "no such table: audit_tests".
+if not store.ready():
+    st.error("The demo database has not been built yet.")
     st.code("python run_pipeline.py", language="bash")
-    st.caption("Run that once, then reload this page.")
+    st.caption("Run that once — it builds the 500-test library, reads the circulars and "
+               "writes the outputs — then reload this page. The database is generated, "
+               "so it is not in the repository and every machine builds its own.")
     st.stop()
 
 counts_line()

@@ -51,12 +51,17 @@ def guide(purpose: str, points: list[tuple[str, str]]) -> None:
 
 
 def database_missing() -> bool:
-    if not Path(config.DB_PATH).exists():
-        st.error("No demo database yet.")
-        st.code("python run_pipeline.py", language="bash")
-        st.caption("Run that once, then reload this page.")
-        return True
-    return False
+    # store.ready() checks that the TABLES exist, not just the file — see the note in
+    # store.ready(). On a fresh clone there is no database at all: it is rebuilt by the
+    # pipeline, never committed.
+    if store.ready():
+        return False
+    st.error("The demo database has not been built yet.")
+    st.code("python run_pipeline.py", language="bash")
+    st.caption("Run that once — it builds the 500-test library, reads the circulars and "
+               "writes the outputs — then reload this page. The database is generated, "
+               "so it is not in the repository and every machine builds its own.")
+    return True
 
 
 # ====== HEADER ======

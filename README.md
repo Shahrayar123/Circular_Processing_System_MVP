@@ -192,6 +192,28 @@ MVP/
 └── output/               generated files
 ```
 
+## Running it on another machine
+
+The database is **generated, not committed** — `mvp_demo.db` is in `.gitignore`, along
+with the client documents. So on a fresh clone:
+
+```bash
+pip install -r requirements.txt
+python run_pipeline.py
+streamlit run simple_app.py
+```
+
+`run_pipeline.py` builds the 500-test library, reads whatever is in `Circulars Data/`
+and writes the outputs. **It must be run before either app**, on every machine.
+
+> **`no such table: audit_tests`** means the pipeline has not been run there yet. SQLite
+> creates the database file the moment anything connects to it, so an empty
+> `mvp_demo.db` can be left behind by a single query — delete it and run the pipeline.
+
+Note that `Circulars Data/` is empty on a clone: the ABL documents are deliberately not
+published. Drop any PDF, Word or Excel file in there — or copy `_format_test/` in — and
+re-run the pipeline.
+
 ## Resetting
 
 Delete `mvp_demo.db` and `output/`, then run the pipeline again. Everything is rebuilt
