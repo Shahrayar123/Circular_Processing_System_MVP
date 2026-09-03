@@ -89,17 +89,18 @@ with tab1:
         "The weekly picture: what arrived, how much of it needed action, and what the "
         "system is proposing.",
         [
-            ("The six figures across the top",
-             "read them left to right — they follow the pipeline. Documents received, "
-             "how many were duplicates, how many clauses came out of the rest, how many "
-             "of those clauses actually create an obligation, and how many changes that "
-             "produced. The drop from clauses to actionable is normal: most of a policy "
+            ("The figures across the top",
+             "read them left to right — they follow the pipeline, and the line beneath "
+             "them reconciles the two clause counts. The drop from clauses read to "
+             "clauses creating an obligation is normal and large: most of a policy "
              "manual is background, not instructions."),
             ("Proposed changes",
-             "the four outcomes. **New** means no existing test covers the obligation. "
-             "**Amendment** means one does but the requirement has changed. "
-             "**Deletion** means the clause withdraws or supersedes something. "
-             "**No action** means nothing testable."),
+             "three outcomes that change the checklist. **New** means no existing test "
+             "covers the obligation. **Amendment** means one does but the requirement "
+             "has changed. **Deletion** means the clause withdraws or supersedes "
+             "something. A fourth outcome, **No action**, is counted separately below "
+             "the chart: the clause was assessed and needs nothing, so it is not a "
+             "change and never reaches sign-off or the export."),
             ("Where the documents came from",
              "the three intake routes. RIA emails are counted separately by body and "
              "attachment because content arrives either way."),
@@ -108,14 +109,19 @@ with tab1:
              "arriving twice, or by two different routes, is only worked once."),
         ])
 
-    c = st.columns(7)
+    c = st.columns(6)
     c[0].metric("Audit tests indexed", f"{counts['tests']:,}")
-    c[1].metric("Documents received", counts["documents"] + counts["duplicates"])
+    c[1].metric("Circulars received", counts["documents"] + counts["duplicates"])
     c[2].metric("Duplicates skipped", counts["duplicates"])
-    c[3].metric("Clauses extracted", counts["clauses"])
-    c[4].metric("Actionable", counts["actionable"])
-    c[5].metric("Changes proposed", counts["proposals"])
-    c[6].metric("Approved for export", counts["approved"])
+    c[3].metric("Clauses creating an obligation", counts["actionable"])
+    c[4].metric("Changes proposed", counts["proposals"])
+    c[5].metric("Approved for export", counts["approved"])
+    st.caption(
+        f"Read left to right, these follow the pipeline. {counts['clauses']} clauses "
+        f"were read in total; {counts['actionable']} of them create an obligation on "
+        f"the bank — the rest are headings, preamble and background. Those "
+        f"{counts['actionable']} were matched against the library, which produced "
+        f"{counts['proposals']} proposed changes.")
 
     st.caption(
         "Process flow — circular intake → AI analysis → Excel working file → "
@@ -133,12 +139,21 @@ with tab1:
     with left:
         st.subheader("Proposed changes")
         by_type = load("SELECT change_type, COUNT(*) n FROM proposals "
+                       "WHERE change_type != 'No action' "
                        "GROUP BY change_type ORDER BY n DESC")
         if not by_type.empty:
             st.bar_chart(by_type.set_index("change_type"), color="#0E6E6E", height=240)
             for _, row in by_type.iterrows():
                 st.markdown(f"{chip(row['change_type'], COLOUR.get(row['change_type'], '#555'))}"
                             f" &nbsp; {row['n']}", unsafe_allow_html=True)
+        # Reported next to the changes, not inside them: these clauses WERE assessed,
+        # and the engine concluded nothing needs doing. They are not signed off and not
+        # exported, so counting them as proposed changes makes every total disagree.
+        if counts.get("no_action"):
+            st.caption(f"A further **{counts['no_action']}** actionable clause(s) were "
+                       f"assessed as needing **no action** — no test added, amended or "
+                       f"deleted. They are not part of the {counts['proposals']} changes "
+                       f"above and do not go through sign-off.")
 
     with right:
         st.subheader("Where the documents came from")
@@ -222,15 +237,20 @@ with tab2:
         meta = st.columns(5)
         meta[0].markdown(f"**Title**  \n{doc['title'] or '—'}")
         meta[1].markdown(f"**Received via**  \n{doc['source']}")
+        # A SQL NULL in a numeric column arrives from pandas as float NaN, and NaN is
+        # TRUTHY — so `if doc["parent_id"]` passes for a document that has no parent and
+        # int(NaN) then raises. Every nullable number needs the notna() guard.
+        ocr_pages = doc.get("ocr_pages")
         meta[2].markdown(f"**Format**  \n{doc.get('kind') or '—'}"
-                         + (f"  \n_{int(doc['ocr_pages'])} page(s) OCR'd_"
-                            if doc.get("ocr_pages") else ""))
+                         + (f"  \n_{int(ocr_pages)} page(s) OCR'd_"
+                            if pd.notna(ocr_pages) and ocr_pages else ""))
         meta[3].markdown(f"**Pages**  \n{doc['pages'] or '—'}")
         meta[4].markdown(f"**Date found**  \n{doc['doc_date'] or '—'}")
 
-        if doc.get("parent_id"):
+        parent_id = doc.get("parent_id")
+        if pd.notna(parent_id):
             parent = store.one("SELECT filename FROM documents WHERE id = ?",
-                               (int(doc["parent_id"]),))
+                               (int(parent_id),))
             st.info(f"This document was found **inside** "
                     f"`{(parent or {}).get('filename', 'another document')}`.", icon="📎")
         kids = load("SELECT filename FROM documents WHERE parent_id = ?",
@@ -247,7 +267,10 @@ with tab2:
             "ORDER BY sequence", (int(chosen),))
 
         actionable = int(clauses["is_actionable"].sum()) if not clauses.empty else 0
-        st.markdown(f"**{len(clauses)} clauses extracted · {actionable} actionable**")
+        st.markdown(f"**In this document: {len(clauses)} clauses extracted · "
+                    f"{actionable} actionable**")
+        st.caption("These are the figures for the selected document only. The dashboard "
+                   "adds up every document in the run.")
 
         show_all = st.toggle("Show clauses marked 'for information only'", value=False)
         for _, cl in clauses.iterrows():
@@ -311,6 +334,10 @@ with tab3:
         "d.filename, d.title AS doc_title FROM proposals p "
         "JOIN clauses c ON c.id = p.clause_id "
         "JOIN documents d ON d.id = p.document_id "
+        # A No-action row is a clause that was assessed and needs nothing. It is not a
+        # change, so it is not signed off and not exported — and it must not pad the
+        # queue, or the dashboard and this screen report different totals.
+        "WHERE p.change_type != 'No action' "
         "ORDER BY p.document_id, c.sequence")
 
     if proposals.empty:
@@ -511,8 +538,9 @@ with tab4:
     m[1].metric("Approved", len(approved_now))
     m[2].metric("Rejected", int(store.scalar(
         "SELECT COUNT(*) FROM proposals WHERE status = 'Rejected'") or 0))
-    m[3].metric("Still at level 1", counts["proposals"] - len(queue) - len(approved_now)
-                - int(store.scalar("SELECT COUNT(*) FROM proposals WHERE status = 'Rejected'") or 0))
+    m[3].metric("Still at level 1", int(store.scalar(
+        "SELECT COUNT(*) FROM proposals WHERE status IN (?, ?) "
+        "AND change_type != 'No action'", (review.PENDING_L1, review.CHANGES)) or 0))
 
     st.divider()
     if queue.empty:

@@ -17,6 +17,7 @@ Three rules, the same ones the delivered system follows:
 """
 
 import hashlib
+import io
 import re
 import shutil
 import subprocess
@@ -311,23 +312,116 @@ READERS = {
 
 # ====== EMBEDDED OBJECTS ======
 
+# An OLE2 compound file. Word writes one of these — "oleObject1.bin" — whenever IT
+# saves an embedded object, which is to say for every document that came from a real
+# user. The workbook is not stored as a plain .xlsx; it is wrapped in this container.
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+# What the payload turns out to be, judged by what is inside the zip rather than by any
+# name — an OLE container carries no filename we can trust.
+_ZIP_MARKERS = [
+    ("xl/workbook.xml", ".xlsx"),
+    ("word/document.xml", ".docx"),
+    ("ppt/presentation.xml", ".pptx"),
+]
+
+
+def _unwrap_ole(data: bytes) -> tuple[str, bytes] | None:
+    """Pull the real file out of an OLE2 wrapper. Returns (suffix, bytes) or None.
+
+    Modern Office payloads (xlsx/docx/pptx) are zips stored whole inside the container,
+    so the zip can be carved out by its own signatures — no extra dependency, which
+    matters for an air-gapped install. olefile is used if it happens to be present,
+    for legacy .xls payloads that are not zips.
+    """
+    if not data.startswith(_OLE_MAGIC):
+        return None
+
+    start = data.find(b"PK\x03\x04")
+    end = data.rfind(b"PK\x05\x06")
+    if start != -1 and end > start:
+        payload = data[start:end + 22]                  # +22 = end-of-central-directory
+        try:
+            with zipfile.ZipFile(io.BytesIO(payload)) as inner:
+                names = set(inner.namelist())
+            for marker, suffix in _ZIP_MARKERS:
+                if marker in names:
+                    return suffix, payload
+        except Exception:
+            pass                                        # carve failed — try olefile
+
+    try:
+        import olefile
+    except ImportError:
+        return None
+    try:
+        with olefile.OleFileIO(io.BytesIO(data)) as ole:
+            streams = {"/".join(s).lower(): s for s in ole.listdir()}
+            for key, suffix in (("package", None), ("workbook", ".xls"), ("book", ".xls")):
+                if key in streams:
+                    payload = ole.openstream(streams[key]).read()
+                    if suffix:
+                        return suffix, payload
+                    return (_sniff_bytes(payload) or ".xlsx"), payload
+    except Exception:
+        pass
+    return None
+
+
+def _sniff_bytes(data: bytes) -> str:
+    """Suffix for a payload we hold in memory, decided by content."""
+    if data[:4] == b"PK\x03\x04":
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                names = set(z.namelist())
+            for marker, suffix in _ZIP_MARKERS:
+                if marker in names:
+                    return suffix
+        except Exception:
+            return ""
+    return ""
+
+
 def _embedded_in_ooxml(path: Path) -> list:
     """Documents stored inside a .docx / .xlsx package.
 
     ABL's own BRD is the proof this matters: a .docx carrying an .xlsm and four .docx
     files under `word/embeddings/`, and the embedded workbook is the specification.
     Reading the outer file and stopping loses it, silently.
+
+    Two shapes appear in the wild and both are handled: the payload stored under its own
+    name (Word 2016+ sometimes does this), and the payload wrapped in an OLE2 container
+    called oleObject1.bin (what Word writes on save). Only the first was handled
+    originally, so an annexure vanished the moment anyone opened and re-saved the
+    circular in Word.
     """
     found = []
     try:
         with zipfile.ZipFile(path) as archive:
             names = [n for n in archive.namelist()
-                     if "/embeddings/" in n and Path(n).suffix.lower() in SUPPORTED]
+                     if "/embeddings/" in n
+                     and Path(n).suffix.lower() in SUPPORTED | {".bin"}]
             for name in names[:12]:                     # a sane cap for a demo
+                data = archive.read(name)
+                label = Path(name).name
+
+                if Path(name).suffix.lower() == ".bin":
+                    unwrapped = _unwrap_ole(data)
+                    if not unwrapped:
+                        # Recorded, never dropped — an annexure that disappears quietly
+                        # is worse than one that reports it could not be opened.
+                        found.append((label, Extracted(
+                            kind="ole-object",
+                            error="embedded object could not be unwrapped from its OLE "
+                                  "container")))
+                        continue
+                    suffix, data = unwrapped
+                    label = Path(name).stem + suffix
+
                 with tempfile.TemporaryDirectory() as tmp:
-                    saved = Path(tmp) / Path(name).name
-                    saved.write_bytes(archive.read(name))
-                    found.append((Path(name).name, read(saved, _depth=1)))
+                    saved = Path(tmp) / label
+                    saved.write_bytes(data)
+                    found.append((label, read(saved, _depth=1)))
     except Exception:
         pass                                            # not a zip, or unreadable
     return found
@@ -384,7 +478,9 @@ _DATE = re.compile(
 
 def guess_title(text: str, filename: str) -> str:
     for line in (text or "").split("\n")[:25]:
-        line = line.strip()
+        # A spreadsheet's first line arrives as "[row 1] ANNEXURE A — ...". The row
+        # marker belongs in the clause text and is noise in a title.
+        line = re.sub(r"^\[row \d+\]\s*", "", line.strip())
         lowered = line.lower()
         if any(w in lowered for w in ("confidential", "for bank", "internal use",
                                       "page ", "table of contents", "all rights",

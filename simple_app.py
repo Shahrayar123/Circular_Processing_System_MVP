@@ -94,26 +94,27 @@ def table(df: pd.DataFrame, pick_column: str | None = None) -> pd.DataFrame:
 
 
 def counts_line() -> None:
-    """Two rows: what the run produced, then where it has reached in the sign-off."""
-    # Row 1 — the pipeline, left to right, the same figures as the full app's dashboard.
-    counts = store.counts()
-    cols = st.columns(7)
-    cols[0].metric("Audit tests indexed", f"{counts['tests']:,}")
-    cols[1].metric("Documents received", counts["documents"] + counts["duplicates"])
-    cols[2].metric("Duplicates skipped", counts["duplicates"])
-    cols[3].metric("Clauses extracted", counts["clauses"])
-    cols[4].metric("Actionable", counts["actionable"])
-    cols[5].metric("Changes proposed", counts["proposals"])
-    cols[6].metric("Approved for export", counts["approved"])
+    """One row. Every figure answers a question the client actually asks.
 
-    # Row 2 — the sign-off queue. Where every proposed change has reached.
+    There were two rows and twelve figures. "Approved" appeared in both, under two
+    names, for the same number — and "Clauses extracted / Actionable" invited the
+    question "so which is it?" without either number being useful on this screen. A
+    figure nobody can act on is not information, it is doubt.
+    """
+    counts = store.counts()
     by_status = store.approval_counts()
-    cols = st.columns(7)
-    cols[0].metric("Waiting for reviewer", by_status.get(review.PENDING_L1, 0))
-    cols[1].metric("Waiting for approver", by_status.get(review.PENDING_L2, 0))
-    cols[2].metric("Approved", by_status.get(review.APPROVED, 0))
-    cols[3].metric("Rejected", by_status.get(review.REJECTED, 0))
-    cols[4].metric("Sent back", by_status.get(review.CHANGES, 0))
+
+    cols = st.columns(5)
+    cols[0].metric("Circulars received", counts["documents"] + counts["duplicates"])
+    cols[1].metric("Changes proposed", counts["proposals"])
+    cols[2].metric("Waiting for reviewer", by_status.get(review.PENDING_L1, 0)
+                   + by_status.get(review.CHANGES, 0))
+    cols[3].metric("Waiting for approver", by_status.get(review.PENDING_L2, 0))
+    cols[4].metric("Approved — ready to export", by_status.get(review.APPROVED, 0))
+
+    rejected = by_status.get(review.REJECTED, 0)
+    if rejected:
+        st.caption(f"{rejected} change(s) rejected and closed.")
 
 
 # ====== PAGE ======
@@ -137,10 +138,6 @@ if not store.ready():
     st.stop()
 
 counts_line()
-st.caption(
-    "The top row follows the pipeline left to right — what arrived, what was read out "
-    "of it, and what the system proposed. The second row is where those proposals have "
-    "reached in the sign-off.")
 st.caption(
     "**Nothing reaches the Excel export without both sign-offs.** The reviewer's "
     "approval only moves a change forward — it never finalises it. Only the approver's "
