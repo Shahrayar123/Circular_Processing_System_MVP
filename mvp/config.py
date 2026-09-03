@@ -20,7 +20,11 @@ TOP_K = 8                      # candidates shown to the decision step
 MIN_CLAUSE_CHARS = 60          # shorter fragments are headings, not obligations.
                                # Kept low because real circulars are often short —
                                # a one-page RIA instruction must not yield 0 clauses.
-MAX_CLAUSES_PER_DOC = 40       # keep the demo quick on 48-page manuals
+MAX_CLAUSES_PER_DOC = 250      # a cap against a runaway document, not a sample size.
+                               # It was 40, which silently TRUNCATED a 48-page manual —
+                               # once lettered lists are split into their items, a real
+                               # circular passes 150 clauses easily and the tail was
+                               # being dropped without a word. The run is still ~2s.
 
 # ====== DECISION ENGINE ======
 # "stub" is deterministic and instant — always works, no model needed.

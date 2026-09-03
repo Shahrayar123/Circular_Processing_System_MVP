@@ -29,6 +29,22 @@ _INFORMATIONAL = re.compile(
     re.IGNORECASE,
 )
 
+# A spreadsheet row, as extract.py writes it: "[row 4] A-1 | Banks shall ... | 01-Oct".
+# Annexures to SBP circulars are very often tables — one requirement per row — so a row
+# is a clause boundary in its own right. Without this the whole sheet arrives as one
+# block and five separate obligations collapse into a single proposal.
+_SHEET_ROW = re.compile(r"^\[row (\d+)\]\s*(.*)$")
+
+# A short first cell that is really the row's own clause id: "A-1", "3.2", "(iv)".
+_ROW_REF = re.compile(r"^\(?[A-Za-z]{0,3}[-.]?\d+(?:\.\d+)*\)?$")
+
+
+def _row_ref(row_number: str, body: str) -> str:
+    """Prefer the annexure's own clause id over the spreadsheet row number."""
+    first = body.split("|")[0].strip()
+    return first if _ROW_REF.match(first) else f"row {row_number}"
+
+
 _SUPERSESSION = re.compile(
     r"\b(supersed\w*|shall stand withdrawn|stand withdrawn|no longer applicable|"
     r"cease to have effect|is hereby cancelled|rescind\w*)\b", re.IGNORECASE)
@@ -49,9 +65,126 @@ _STRATA_HINTS = [
 ]
 
 
+# ====== LEAD-IN SENTENCES AND THEIR LISTS ======
+#
+# Circulars constantly write an obligation as a stem plus a list:
+#
+#     The risk assessment shall cover at least the following aspects:
+#     a) A current and detailed description of the bank's business ...
+#     b) Internet Banking assets are identified and prioritised.
+#
+# Two things go wrong if this is left alone. The stem becomes a clause with no content
+# — "shall cover the following aspects" is not a testable obligation — and the list
+# becomes ONE clause, so seven separate requirements produce a single proposal and six
+# audit tests are never written.
+#
+# The stem and the list are also routinely separated: the stem sits at the foot of one
+# page and the list starts on the next, and in a marked-up draft a column of review
+# comments can land between them in reading order. So a list looks BACKWARDS for its
+# stem rather than a stem looking forwards.
+
+_LIST_ITEM = re.compile(
+    r"^\(?(?P<mark>[a-zA-Z]|[ivxIVX]{1,5}|\d{1,2})[).]\s+|^\s*[•▪]\s+")
+
+_LEAD_IN = re.compile(r":\s*$")
+_MAX_LEAD_IN_CHARS = 320          # a stem is a sentence, not a paragraph
+_LEAD_IN_LOOKBACK = 2500          # far enough to cross a page and a margin column
+_MIN_LIST_ITEM_CHARS = 25         # "b) Assets are prioritised." is a real obligation
+
+
+# The first marker of a real enumeration. Requiring the list to START at its opener is
+# what stops a stem binding to the wrong list: a marked-up circular carries quoted
+# fragments like "vi. Implement ISMS2 ... ix. Ensure that ..." in a margin column, and
+# those sit between a stem and the list it actually introduces. A fragment beginning at
+# "vi." is a quotation, not the list this sentence opened.
+_OPENERS = {"a", "A", "i", "I", "1"}
+
+
+def _split_list_items(piece: str) -> tuple[str, list[str]]:
+    """Break "The following apply: a) ... b) ..." into (stem, items).
+
+    The stem is whatever precedes the first marker in the same block — often the whole
+    sentence that makes the items testable — and is returned separately so it can be
+    carried onto each item rather than surviving as a clause of its own. Returns
+    ("", []) when the text is not a list.
+    """
+    for pattern in (r"(?=(?<![A-Za-z0-9])[a-z][)]\s)",       # a) b) c)
+                    r"(?=(?<![A-Za-z0-9])[ivx]{1,5}[).]\s)",  # i) ii) iii)
+                    r"(?=(?<![A-Za-z0-9])\d{1,2}[)]\s)",      # 1) 2) 3)
+                    r"(?=[•▪]\s)"):
+        parts = [p.strip() for p in re.split(pattern, piece) if p.strip()]
+        items = [p for p in parts
+                 if _LIST_ITEM.match(p) and len(p) >= _MIN_LIST_ITEM_CHARS]
+
+        # Two items make a list; one match is far more likely to be prose.
+        if len(items) < 2:
+            continue
+        first = _LIST_ITEM.match(items[0])
+        if first and (first.group("mark") or "") not in _OPENERS:
+            continue                                  # starts mid-sequence: a quotation
+
+        stem = parts[0] if parts and not _LIST_ITEM.match(parts[0]) else ""
+        return stem, items
+    return "", []
+
+
+def _attach_lead_ins(pieces: list[tuple]) -> list[tuple]:
+    """Give every list item the stem that introduces it, and drop the bare stem.
+
+    `pieces` is [(ref, text, start)] in document order; the same shape comes back.
+    """
+    stems: list[tuple[int, int, str]] = []          # (source index, start, text)
+    out: list[tuple] = []                           # (ref, text, start, source index)
+    consumed: set[int] = set()
+
+    for index, (ref, piece, start) in enumerate(pieces):
+        inline_stem, items = _split_list_items(piece)
+
+        # The stem in reach, if there is one: the most recent, and only while it is
+        # close enough to still be the sentence that opened this list.
+        pending = None
+        if stems and start - stems[-1][1] <= _LEAD_IN_LOOKBACK:
+            pending = stems[-1]
+
+        if items:
+            # A stem in the same block wins: it is unambiguously this list's sentence.
+            stem_text = inline_stem
+            if not stem_text and pending:
+                stem_text = pending[2]
+                consumed.add(pending[0])
+            for item in items:
+                out.append((ref, f"{stem_text} {item}" if stem_text else item,
+                            start, index))
+            continue
+
+        # A list whose items are split across blocks — a page break falls between "a)"
+        # and "b)", so each arrives alone and the two-item rule above never fires. A
+        # marker at the very START of a block is a safe enough signal on its own; the
+        # same marker mid-sentence is not, which is why this is not the general rule.
+        if _LIST_ITEM.match(piece) and pending:
+            consumed.add(pending[0])
+            out.append((ref, f"{pending[2]} {piece}", start, index))
+            continue
+
+        # Only a stem that states a DUTY is worth carrying onto the items. A circular
+        # is full of colons that introduce quotations rather than obligations —
+        # "the policy states below:" — and in a marked-up draft those sit closer to the
+        # list than the real stem does. "shall cover at least the following aspects:"
+        # is the sentence that makes each item testable; the other is not.
+        if (_LEAD_IN.search(piece) and len(piece) <= _MAX_LEAD_IN_CHARS
+                and _OBLIGATION.search(piece)):
+            stems.append((index, start, piece))
+        out.append((ref, piece, start, index))
+
+    # A stem whose list was found is now carried by every item; on its own it says
+    # nothing testable, so it must not reach the reviewer as a clause of its own.
+    return [(ref, piece, start) for ref, piece, start, index in out
+            if index not in consumed]
+
+
 def split_clauses(text: str) -> list[dict]:
     """Break the text into clause-sized pieces, keeping character offsets."""
-    clauses, cursor = [], 0
+    clauses, collected, cursor = [], [], 0
     blocks = re.split(r"\n\s*\n", text)
 
     for block in blocks:
@@ -61,13 +194,23 @@ def split_clauses(text: str) -> list[dict]:
         cursor = block_start + len(block)
 
         block = block.strip()
-        if len(block) < config.MIN_CLAUSE_CHARS:
+        # A short block is normally a heading — except when it ends in a colon, which
+        # makes it the stem of a list that may not start until the next page.
+        if len(block) < config.MIN_CLAUSE_CHARS and not _LEAD_IN.search(block):
             continue
 
         # split a long block on numbered openers so each obligation stands alone
         lines, current, current_ref = block.split("\n"), [], None
         pieces = []
         for line in lines:
+            sheet_row = _SHEET_ROW.match(line.strip())
+            if sheet_row:
+                if current:
+                    pieces.append((current_ref, " ".join(current).strip()))
+                current_ref = _row_ref(sheet_row.group(1), sheet_row.group(2))
+                current = [sheet_row.group(2).strip()]
+                continue
+
             match = _NUMBERED.match(line)
             if match and current:
                 pieces.append((current_ref, " ".join(current).strip()))
@@ -79,16 +222,21 @@ def split_clauses(text: str) -> list[dict]:
             pieces.append((current_ref, " ".join(current).strip()))
 
         for ref, piece in pieces:
-            if len(piece) < config.MIN_CLAUSE_CHARS:
-                continue
             offset = text.find(piece[:60], block_start)
-            start = offset if offset != -1 else block_start
-            clauses.append({
-                "clause_ref": ref,
-                "text": piece,
-                "char_start": start,
-                "char_end": start + len(piece),
-            })
+            collected.append((ref, piece, offset if offset != -1 else block_start))
+
+    # Lists are joined to the sentence that introduces them before anything is measured
+    # — an item is often short on its own and only reaches a sensible length once it
+    # carries its stem.
+    for ref, piece, start in _attach_lead_ins(collected):
+        if len(piece) < config.MIN_CLAUSE_CHARS:
+            continue
+        clauses.append({
+            "clause_ref": ref,
+            "text": piece,
+            "char_start": start,
+            "char_end": start + len(piece),
+        })
 
     return clauses
 

@@ -172,8 +172,16 @@ def load_library() -> list[dict]:
     return rows
 
 
+# A "No action" proposal is a clause that WAS assessed and needs nothing done. It is not
+# a change, it never enters the sign-off queue, and it is never exported. Counting it as
+# a proposed change makes the dashboard disagree with every screen that lists changes —
+# so it is excluded here, once, rather than in each caller.
+_IS_CHANGE = "change_type != 'No action'"
+
+
 def approval_counts() -> dict:
-    rows = query("SELECT status, COUNT(*) n FROM proposals GROUP BY status")
+    rows = query(f"SELECT status, COUNT(*) n FROM proposals WHERE {_IS_CHANGE} "
+                 "GROUP BY status")
     return {r["status"]: r["n"] for r in rows}
 
 
@@ -187,8 +195,15 @@ def counts() -> dict:
         "ocr_pages": scalar("SELECT COALESCE(SUM(ocr_pages), 0) FROM documents") or 0,
         "clauses": scalar("SELECT COUNT(*) FROM clauses") or 0,
         "actionable": scalar("SELECT COUNT(*) FROM clauses WHERE is_actionable = 1") or 0,
-        "proposals": scalar("SELECT COUNT(*) FROM proposals") or 0,
-        "approved": scalar("SELECT COUNT(*) FROM proposals WHERE status = 'Approved'") or 0,
+        # "assessed" is every clause the engine ruled on; "proposals" is the subset that
+        # proposes a change, and is the number every other screen lists. They differ by
+        # the No-action rows, which are reported in their own right.
+        "assessed": scalar("SELECT COUNT(*) FROM proposals") or 0,
+        "proposals": scalar(f"SELECT COUNT(*) FROM proposals WHERE {_IS_CHANGE}") or 0,
+        "no_action": scalar("SELECT COUNT(*) FROM proposals "
+                            "WHERE change_type = 'No action'") or 0,
+        "approved": scalar(f"SELECT COUNT(*) FROM proposals WHERE status = 'Approved' "
+                           f"AND {_IS_CHANGE}") or 0,
         "pending": scalar("SELECT COUNT(*) FROM proposals "
-                          "WHERE status NOT IN ('Approved', 'Rejected')") or 0,
+                          f"WHERE status NOT IN ('Approved', 'Rejected') AND {_IS_CHANGE}") or 0,
     }
