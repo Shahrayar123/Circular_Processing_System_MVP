@@ -21,6 +21,8 @@ rank-bm25==0.2.2            # the keyword half of retrieval
 pypdf==5.1.0                # PDF text layer, page count
 python-docx==1.1.2          # Word in (clauses) and Word out (working document)
 openpyxl==3.1.5             # Excel in (annexures) and Excel out (working file, eAudit)
+python-pptx==1.0.2          # ABL confirmed circulars also arrive as PowerPoint
+extract-msg==0.53.1         # Outlook .msg from the RIA mailbox
 
 # ====== OCR — scanned PDFs and images ======
 # Needed only for scanned material. Both packages are thin wrappers: they also require
@@ -38,8 +40,6 @@ pillow==11.0.0              # image handling for the above
 # Every one of these is imported inside a try/except. Leave them out and the demo
 # still runs; the affected file type is recorded as unreadable with the reason.
 
-# extract-msg==0.53.1       # Outlook .msg files from the RIA mailbox
-# python-pptx==1.0.2        # PowerPoint circular annexures
 # httpx==0.28.1             # only for `run_pipeline.py --engine ollama`
 
 # Legacy .doc / .xls / .ppt are converted with LIBREOFFICE, which is not a pip

@@ -28,15 +28,22 @@ COLOUR = {"New": "#2E7A4F", "Amendment": "#9C6F11", "Deletion": "#B03A30",
 
 # Bump when the schema changes — otherwise a cached frame from before the change is
 # served and columns appear to be missing.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 7   # bumped: obligations table, proposals.obligation_id
 
 
 @st.cache_data(show_spinner=False)
 def load(sql: str, params: tuple = (), _v: int = SCHEMA_VERSION) -> pd.DataFrame:
+    """Run a query and return a DataFrame, cached by Streamlit.
+
+    `_v` is in the signature ONLY to make SCHEMA_VERSION part of the cache key: without
+    it, a frame cached before a schema change is served afterwards and columns appear
+    to be missing.
+    """
     return pd.DataFrame(store.query(sql, params))
 
 
 def chip(text: str, colour: str) -> str:
+    """A small coloured label, as inline HTML."""
     return (f"<span style='background:{colour}1A;color:{colour};padding:2px 9px;"
             f"border-radius:3px;font-size:12px;font-weight:600'>{text}</span>")
 
@@ -54,6 +61,12 @@ def database_missing() -> bool:
     # store.ready() checks that the TABLES exist, not just the file — see the note in
     # store.ready(). On a fresh clone there is no database at all: it is rebuilt by the
     # pipeline, never committed.
+    """True when the demo database has not been built, having already shown the user how.
+
+    Checks that the TABLES exist, not just the file — SQLite creates an empty file on any
+    connection, and a file-only check turns "run the pipeline first" into "no such
+    table: audit_tests".
+    """
     if store.ready():
         return False
     st.error("The demo database has not been built yet.")
@@ -139,7 +152,7 @@ with tab1:
     with left:
         st.subheader("Proposed changes")
         by_type = load("SELECT change_type, COUNT(*) n FROM proposals "
-                       "WHERE change_type != 'No action' "
+                       f"WHERE {store.IS_CHANGE} "
                        "GROUP BY change_type ORDER BY n DESC")
         if not by_type.empty:
             st.bar_chart(by_type.set_index("change_type"), color="#0E6E6E", height=240)
@@ -247,6 +260,26 @@ with tab2:
         meta[3].markdown(f"**Pages**  \n{doc['pages'] or '—'}")
         meta[4].markdown(f"**Date found**  \n{doc['doc_date'] or '—'}")
 
+        # A superseded document still holds the clauses and proposals that were current
+        # when it was the live version, so it stays fully browsable — but it must never
+        # be mistaken for the version in force. Said on the document itself, because this
+        # is the screen someone opens when a proposal looks unfamiliar.
+        replaced_by = doc.get("superseded_by")
+        if pd.notna(replaced_by):
+            newer = store.one("SELECT filename FROM documents WHERE id = ?",
+                              (int(replaced_by),))
+            st.warning(
+                f"**This version has been superseded.** It was replaced by "
+                f"`{(newer or {}).get('filename', 'a later version')}`. Proposals nobody "
+                f"had acted on were withdrawn; any already reviewed or approved were left "
+                f"alone and should be checked against the new text.", icon="♻️")
+        replaces = doc.get("supersedes")
+        if pd.notna(replaces):
+            older = store.one("SELECT filename, ingested_at FROM documents WHERE id = ?",
+                              (int(replaces),))
+            st.info(f"This is a **reissue**. It replaces the version received on "
+                    f"{(older or {}).get('ingested_at', 'an earlier date')}.", icon="♻️")
+
         parent_id = doc.get("parent_id")
         if pd.notna(parent_id):
             parent = store.one("SELECT filename FROM documents WHERE id = ?",
@@ -263,6 +296,7 @@ with tab2:
 
         clauses = load(
             "SELECT sequence, clause_ref, is_actionable, strata_tag, reason, text, "
+            "judged_by, segmented_by, model_input_truncated, "
             "page_number, char_start, char_end FROM clauses WHERE document_id = ? "
             "ORDER BY sequence", (int(chosen),))
 
@@ -271,6 +305,32 @@ with tab2:
                     f"{actionable} actionable**")
         st.caption("These are the figures for the selected document only. The dashboard "
                    "adds up every document in the run.")
+
+        # Who made the actionable / not-actionable call. Shown because the answer differs
+        # between the two judges, and a demo that had quietly fallen back to keyword
+        # rules would otherwise look identical to one using the model.
+        judges = clauses["judged_by"].fillna("rules").value_counts()             if not clauses.empty else {}
+        if len(judges):
+            st.caption("Actionability judged by — "
+                       + ", ".join(f"**{name}**: {n} clause(s)"
+                                   for name, n in judges.items()))
+
+        # Which rung of the splitting ladder produced these clauses. Anything other than
+        # "structure" means the patterns did not fit this document and the splitter fell
+        # back — which a reader needs to know before trusting the clauses below.
+        rungs = clauses["segmented_by"].fillna("structure").value_counts() if not clauses.empty else {}
+        if len(rungs):
+            st.caption("Split by — "
+                       + ", ".join(f"**{name}**: {n} clause(s)" for name, n in rungs.items())
+                       + ". *structure* is numbering, headings and table rows; anything "
+                         "else means the splitter fell back.")
+
+        # A suspicious split is shown ON the document, because it explains every number
+        # below it and is otherwise invisible.
+        if doc.get("segment_warning"):
+            st.warning(f"**Check this document's split** — {doc['segment_warning']}. The "
+                       f"clauses below may be fragmented or run together, which affects "
+                       f"every proposal made from them.", icon="⚠️")
 
         show_all = st.toggle("Show clauses marked 'for information only'", value=False)
         for _, cl in clauses.iterrows():
@@ -287,7 +347,9 @@ with tab2:
             st.markdown(
                 f"<div style='border-left:3px solid {colour};padding:6px 0 6px 12px;"
                 f"margin:4px 0 14px 0;font-size:14px'>{cl['text'][:900]}"
-                f"<div style='color:#64757A;font-size:12px;margin-top:6px'>{cl['reason']}</div>"
+                f"<div style='color:#64757A;font-size:12px;margin-top:6px'>{cl['reason']}"
+                f"<span style='opacity:.7'> · judged by "
+                f"{cl['judged_by'] or 'rules'}</span></div>"
                 f"</div>", unsafe_allow_html=True)
 
 
@@ -337,7 +399,7 @@ with tab3:
         # A No-action row is a clause that was assessed and needs nothing. It is not a
         # change, so it is not signed off and not exported — and it must not pad the
         # queue, or the dashboard and this screen report different totals.
-        "WHERE p.change_type != 'No action' "
+        f"WHERE {store.is_change('p')} "
         "ORDER BY p.document_id, c.sequence")
 
     if proposals.empty:
@@ -540,7 +602,7 @@ with tab4:
         "SELECT COUNT(*) FROM proposals WHERE status = 'Rejected'") or 0))
     m[3].metric("Still at level 1", int(store.scalar(
         "SELECT COUNT(*) FROM proposals WHERE status IN (?, ?) "
-        "AND change_type != 'No action'", (review.PENDING_L1, review.CHANGES)) or 0))
+        f"AND {store.IS_CHANGE}", (review.PENDING_L1, review.CHANGES)) or 0))
 
     st.divider()
     if queue.empty:
@@ -742,7 +804,7 @@ with tab5:
 | Reviewer → Approver workflow | **present** — two levels, with a decision history |
 | Named users, roles, RBAC, append-only audit log | not included |
 | Quarterly eAudit export | **present** — approved changes only |
-| Versioning and snapshots on every edit | not included |
+| Versioning and snapshots on every edit | **before/after stored on every proposal, and an append-only `proposal_revisions` row for each human edit** — no named users, so an edit records the role, not the person |
 """)
 
 
