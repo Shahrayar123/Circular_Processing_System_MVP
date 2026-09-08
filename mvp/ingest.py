@@ -24,6 +24,9 @@ from . import config, extract, store
 
 
 def file_hash(path: Path) -> str:
+    """SHA-256 of the file's CONTENTS. De-duplication is on content, never on filename,
+    so the same circular arriving twice or by two routes is worked once.
+    """
     digest = hashlib.sha256()
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -32,6 +35,7 @@ def file_hash(path: Path) -> str:
 
 
 def text_hash(text: str) -> str:
+    """SHA-256 of extracted text — used where there is no file on disk, such as an email body."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -39,24 +43,84 @@ def _skip(path: Path) -> bool:
     return path.name.startswith((".", "~$")) or path.suffix.lower() not in extract.SUPPORTED
 
 
+def _already_processed(conn, filename: str, hash_value: str) -> dict | None:
+    """The outcome for a file an earlier run already handled, or None to go on and read it.
+
+    Matched on hash AND filename together, deliberately. Hash alone would swallow a
+    genuine second copy arriving under a new name; filename alone would miss a circular
+    reissued with corrected content under the same name — which must be re-read, and is,
+    because the hash no longer matches.
+
+    A row is only proof of completion if `processed_at` is set. The document row is
+    written at intake, before splitting, so a run that died in between leaves a row with
+    nothing behind it — and treating that as done is how a circular disappears for good,
+    skipped on every future run with no error anywhere.
+    """
+    seen = conn.execute(
+        "SELECT id, status FROM documents WHERE file_hash = ? AND filename = ?",
+        (hash_value, filename),
+    ).fetchone()
+    if not seen:
+        return None
+
+    if store.is_complete(conn, seen["id"]):
+        return {"status": "unchanged", "filename": filename,
+                "document_id": seen["id"], "previous_status": seen["status"]}
+
+    if store.reclaim(conn, seen["id"]):
+        return None                     # half-finished and untouched: read it properly now
+
+    # Someone has acted on part of it. Leave it alone and say so — a half-finished
+    # document with human decisions on it needs a person, not a retry.
+    return {"status": "unchanged", "filename": filename,
+            "document_id": seen["id"], "previous_status": seen["status"],
+            "note": "incomplete, but a human has already acted on it"}
+
+
+def _record_duplicate(conn, existing, *, filename, source, source_detail, hash_value,
+                      pages, parent_id, kind) -> dict:
+    """Record that the same CONTENT arrived again under a different name.
+
+    Kept rather than ignored: a circular sent twice is a real event in the week's intake
+    and the team should see it.
+    """
+    dup_id = store.insert(conn, "documents", {
+        "filename": filename, "source": source, "source_detail": source_detail,
+        "file_hash": hash_value, "title": None, "doc_date": None, "pages": pages,
+        "status": "duplicate", "duplicate_of": existing["id"],
+        "ingested_at": datetime.now().isoformat(timespec="seconds"),
+        "parent_id": parent_id, "kind": kind, "ocr_pages": 0, "error": None,
+    })
+    # A duplicate is finished the moment it is recognised — there is nothing else to do
+    # with it. Marked complete here, or the next run would see an unprocessed row, reclaim
+    # it and record the same duplicate all over again, every run for ever.
+    store.mark_processed(conn, dup_id)
+    return {"status": "duplicate", "filename": filename,
+            "duplicate_of": existing["filename"]}
+
+
 def _record(conn, *, filename, source, source_detail, hash_value, text, pages,
             parent_id=None, kind="", ocr_pages=0, error="") -> dict:
-    """Insert a document, or mark it a duplicate of one already seen."""
+    """Record one document. Returns one of three outcomes:
+
+    * **unchanged** — this exact file was processed by an earlier run. Its clauses and
+      proposals are already in the database, possibly reviewed and approved. Nothing is
+      written and nothing is re-processed.
+    * **duplicate** — the same CONTENT arrived under a different name. Recorded.
+    * **ingested** — new. This is the only outcome that leads to clause extraction.
+    """
+    outcome = _already_processed(conn, filename, hash_value)
+    if outcome:
+        return outcome
+
     existing = conn.execute(
         "SELECT id, filename FROM documents WHERE file_hash = ? AND status != 'duplicate'",
         (hash_value,),
     ).fetchone()
-
     if existing:
-        store.insert(conn, "documents", {
-            "filename": filename, "source": source, "source_detail": source_detail,
-            "file_hash": hash_value, "title": None, "doc_date": None, "pages": pages,
-            "status": "duplicate", "duplicate_of": existing["id"],
-            "ingested_at": datetime.now().isoformat(timespec="seconds"),
-            "parent_id": parent_id, "kind": kind, "ocr_pages": 0, "error": None,
-        })
-        return {"status": "duplicate", "filename": filename,
-                "duplicate_of": existing["filename"]}
+        return _record_duplicate(conn, existing, filename=filename, source=source,
+                                 source_detail=source_detail, hash_value=hash_value,
+                                 pages=pages, parent_id=parent_id, kind=kind)
 
     # A file that could not be read is STORED WITH ITS ERROR, never dropped. A circular
     # that vanishes silently is the worst outcome — the team believes it was processed.
@@ -72,9 +136,46 @@ def _record(conn, *, filename, source, source_detail, hash_value, text, pages,
         "parent_id": parent_id, "kind": kind, "ocr_pages": ocr_pages,
         "error": error or None,
     })
-    return {"status": status, "filename": filename, "document_id": doc_id,
-            "chars": len(text), "pages": pages, "kind": kind,
-            "ocr_pages": ocr_pages, "error": error, "parent_id": parent_id}
+
+    outcome = {"status": status, "filename": filename, "document_id": doc_id,
+               "chars": len(text), "pages": pages, "kind": kind,
+               "ocr_pages": ocr_pages, "error": error, "parent_id": parent_id}
+
+    # A reissue changes work already in the reviewer's queue, so it is reported back to
+    # the caller rather than handled quietly here.
+    replaced = _find_reissued(conn, filename, doc_id, parent_id)
+    if replaced:
+        outcome["supersedes"] = replaced["filename"]
+        outcome["supersession"] = store.supersede(conn, replaced["id"], doc_id)
+    return outcome
+
+
+def _find_reissued(conn, filename: str, new_id: int, parent_id) -> dict | None:
+    """The completed top-level document this file replaces, if it is a reissue.
+
+    A reissue is the same FILENAME with different content — SBP sends "BPRD Circular
+    No. 09 of 2026.pdf" again with a clause corrected, and the bank saves over the old
+    one. Different content means a different hash, so it has already been read as a new
+    document by the time this runs; all that is missing is the link.
+
+    Restricted to top-level documents on purpose. Embedded children are matched on the
+    filename their container gives them — "Microsoft_Excel_Worksheet.xlsx", "Annexure
+    B.docx" — which repeats across unrelated circulars, so filename equality between two
+    children means nothing. A changed annexure is instead superseded through its parent.
+
+    Returns None when there is nothing to supersede, which is the normal case.
+    """
+    if parent_id is not None:
+        return None
+    row = conn.execute(
+        "SELECT id, filename FROM documents "
+        "WHERE filename = ? AND id != ? AND parent_id IS NULL "
+        "  AND status = 'ingested' AND processed_at IS NOT NULL "
+        # Only the newest surviving version — a circular reissued three times must form a
+        # chain, not have every earlier version point at the latest one.
+        "  AND superseded_by IS NULL "
+        "ORDER BY id DESC LIMIT 1", (filename, new_id)).fetchone()
+    return dict(row) if row else None
 
 
 def _record_tree(conn, *, filename, source, source_detail, hash_value,
@@ -111,6 +212,10 @@ def _record_tree(conn, *, filename, source, source_detail, hash_value,
 # ====== SOURCE: FOLDER ======
 
 def scan_folder(conn) -> list[dict]:
+    """Read every circular in the watched folder and record it. Returns one result per file.
+
+    Word's `~$` lock files and unsupported types are skipped before any reading happens.
+    """
     results = []
     for path in sorted(config.CIRCULARS_DIR.glob("*")):
         if path.is_dir() or _skip(path):
@@ -183,6 +288,12 @@ def scan_emails(conn) -> list[dict]:
 
 
 def run() -> list[dict]:
+    """Ingest everything — the circular folder and the RIA mailbox — and return every result.
+
+    A result is one of: ingested, duplicate, or error. Failures are RETURNED, never
+    raised: a circular that vanishes quietly is the worst outcome, because the team
+    believes it was processed.
+    """
     config.ensure_dirs()
     with store.connect() as conn:
         return scan_emails(conn) + scan_folder(conn)

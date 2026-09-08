@@ -46,12 +46,17 @@ def proposals(status: str | list[str] | None = None) -> pd.DataFrame:
     sql = ("SELECT p.id, p.sr_no, p.change_type, p.department, p.strata, "
            "       p.target_test_code, p.existing_test_description, "
            "       p.proposed_test_description, p.risk_rating, p.status, "
+           "       p.existing_risk_rating, p.existing_department, "
+           "       p.rationale, p.decided_at, "
+           "       p.obligation_index, o.text AS obligation_text, "
+           "       (SELECT COUNT(*) FROM obligations x WHERE x.clause_id = c.id) AS obligation_count, "
            "       p.reviewer_note, p.approver_note, c.clause_ref, c.text AS clause_text, "
            "       COALESCE(d.title, d.filename) AS circular "
            "FROM proposals p "
+           "LEFT JOIN obligations o ON o.id = p.obligation_id "
            "JOIN clauses c ON c.id = p.clause_id "
            "JOIN documents d ON d.id = p.document_id "
-           "WHERE p.change_type != 'No action' ")
+           f"WHERE {store.is_change('p')} ")
     params: tuple = ()
     if status:
         wanted = [status] if isinstance(status, str) else list(status)
@@ -79,9 +84,15 @@ def table(df: pd.DataFrame, pick_column: str | None = None) -> pd.DataFrame:
         return view
 
     view.insert(0, pick_column, False)
+    # The proposed wording is editable in place: an auditor correcting a draft test is
+    # the normal case, and forcing them to reject-and-wait would be theatre. Every edit
+    # is written to proposal_revisions before the proposal changes.
+    editable = {pick_column}
+    if pick_column == "Accept":
+        editable.add("Proposed test / change")
     edited = st.data_editor(
         view, hide_index=True, use_container_width=True, height=430,
-        disabled=[c for c in view.columns if c != pick_column],
+        disabled=[c for c in view.columns if c not in editable],
         column_config={
             pick_column: st.column_config.CheckboxColumn(pick_column, width="small"),
             "Proposed test / change": st.column_config.TextColumn(width="large"),
@@ -171,13 +182,58 @@ if step == STEPS[0]:
             f"{t} &nbsp;{n}</span>" for t, n in chips.items()), unsafe_allow_html=True)
         st.write("")
         table(df)
-        with st.expander("Where a change came from"):
+        with st.expander("Where a change came from — and what exactly changes"):
             pick = st.selectbox("Proposed change", df["sr_no"], label_visibility="collapsed")
             row = df[df["sr_no"] == pick].iloc[0]
             st.markdown(f"**{row['circular']}** — clause {row['clause_ref'] or '—'}")
             st.info(row["clause_text"])
-            st.markdown(f"**Proposed {row['change_type'].lower()}** — "
-                        f"{row['proposed_test_description'] or '—'}")
+
+            # A clause carrying several duties produces several proposals, all sharing one
+            # source reference. Say which duty this row is, or the reviewer sees the same
+            # clause three times and assumes it is a duplicate.
+            if (row.get("obligation_count") or 1) > 1:
+                st.warning(
+                    f"This clause states **{int(row['obligation_count'])} separate "
+                    f"obligations**, and each is proposed and approved on its own. This is "
+                    f"obligation **{int(row['obligation_index'])}**:", icon="⚖️")
+                st.markdown(f"> {row['obligation_text']}")
+
+            # Before and after, side by side. The "before" is the snapshot taken when the
+            # decision was made, not a live read of the library — the library moves, and
+            # the reviewer has to see what they are actually approving a change against.
+            before, after = st.columns(2)
+            with before:
+                st.markdown("**Existing test — as the library holds it**")
+                if row["target_test_code"]:
+                    st.markdown(f"`{row['target_test_code']}`  ·  "
+                                f"{row['existing_department'] or '—'}  ·  risk "
+                                f"{row['existing_risk_rating'] or '—'}")
+                    st.write(row["existing_test_description"] or "—")
+                else:
+                    st.caption("None — no existing test covers this obligation, which is "
+                               "why the proposal is a new test.")
+            with after:
+                st.markdown(f"**After the proposed {row['change_type'].lower()}**")
+                st.markdown(f"{row['department'] or '—'}  ·  risk "
+                            f"{row['risk_rating'] or '—'}")
+                st.write(row["proposed_test_description"] or
+                         "— (a deletion removes the test above)")
+
+            st.caption(f"Why: {row['rationale']}")
+            st.caption(f"Decided {row['decided_at'] or '—'}. Every field above is stored "
+                       f"with the proposal, so what the system proposed can always be "
+                       f"compared with what was finally approved.")
+
+            edits = review.revisions(int(row["id"]))
+            if edits:
+                st.markdown("**Changed by a human since**")
+                for e in edits:
+                    st.markdown(
+                        f"- *{review.EDITABLE.get(e['field'], e['field'])}* — "
+                        f"{e['changed_by']}, {e['changed_at']}"
+                        + (f" ({e['note']})" if e["note"] else ""))
+                    st.caption(f"from: {(e['old_value'] or '—')[:300]}")
+                    st.caption(f"to:  {(e['new_value'] or '—')[:300]}")
 
 
 # ---- 2 · REVIEWER ----
@@ -207,6 +263,18 @@ elif step == STEPS[1]:
             confirm_deletion = st.checkbox(
                 f"I confirm the {len(deletions)} DELETION(s) selected — these remove "
                 f"existing audit tests", key="confirm_del")
+
+        # An edit is recorded whether the row is signed off or not — the reviewer
+        # changed the wording either way, and losing that silently is the one thing an
+        # audit trail exists to prevent.
+        amended = 0
+        for position, proposal_id in enumerate(df["id"]):
+            new_text = str(edited["Proposed test / change"].iloc[position] or "")
+            if review.edit(int(proposal_id), "proposed_test_description", new_text,
+                           level=1, note=note):
+                amended += 1
+        if amended:
+            st.caption(f"{amended} wording change(s) recorded against the original.")
 
         left, right, _ = st.columns([1, 1, 4])
         if left.button(f"Sign off {len(chosen)} change(s)", type="primary",

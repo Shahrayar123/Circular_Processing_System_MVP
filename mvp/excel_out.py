@@ -180,7 +180,8 @@ def _week_mis(wb: Workbook, docs: list[dict], proposals: list[dict]) -> None:
     row = 4
     for i, doc in enumerate(docs, start=1):
         made = [p for p in proposals if p["document_id"] == doc["id"]
-                and p["change_type"] != "No action"]
+                and p["change_type"] != "No action"
+            and p["status"] != store.WITHDRAWN]
         if doc["status"] == "duplicate":
             actionable, action = "—", "Duplicate — already processed"
         elif made:
@@ -200,6 +201,11 @@ def _week_mis(wb: Workbook, docs: list[dict], proposals: list[dict]) -> None:
 
 
 def build() -> Path:
+    """Write the Excel working file and return its path.
+
+    Every row carries its Review Status, so a pre-approval working file cannot be
+    mistaken for an approved one.
+    """
     proposals = store.query(
         "SELECT p.*, c.clause_ref FROM proposals p "
         "JOIN clauses c ON c.id = p.clause_id ORDER BY p.id")

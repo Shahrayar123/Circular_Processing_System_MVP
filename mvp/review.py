@@ -21,6 +21,11 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 from . import config, store
 
+# Re-exported from store so there is ONE definition of each status string. A status
+# spelled slightly differently in two files is a proposal that silently stops
+# matching its own queue.
+WITHDRAWN = store.WITHDRAWN
+
 PENDING_L1 = "Pending review"
 PENDING_L2 = "Pending approval"
 APPROVED = "Approved"
@@ -51,6 +56,9 @@ _ACCEPTS = {
 
 
 def current_status(proposal_id: int) -> str:
+    """The proposal's status now. Read before every decision, so a stale browser tab cannot
+    apply a decision that no longer makes sense.
+    """
     row = store.one("SELECT status FROM proposals WHERE id = ?", (proposal_id,))
     return (row or {}).get("status", PENDING_L1)
 
@@ -87,6 +95,11 @@ def decide(proposal_id: int, level: int, decision: str, note: str = "") -> str:
 
 
 def decide_many(proposal_ids: list[int], level: int, decision: str, note: str = "") -> int:
+    """Apply one decision to several proposals. Returns how many were attempted.
+
+    Each goes through decide(), so a proposal that is not actionable at this level is a
+    no-op rather than a second decision on the same row.
+    """
     for proposal_id in proposal_ids:
         decide(proposal_id, level, decision, note)
     return len(proposal_ids)
@@ -95,6 +108,11 @@ def decide_many(proposal_ids: list[int], level: int, decision: str, note: str = 
 def reset_all() -> None:
     # An eAudit file written before the reset would otherwise survive and still be
     # offered for download, implying approvals that no longer exist.
+    """Return every proposal to Pending review and clear the sign-off trail. DEMO ONLY.
+
+    Also deletes a previously written eAudit file: leaving it on disk would keep offering
+    a download that implies approvals which no longer exist.
+    """
     stale = config.OUTPUT_DIR / "eAudit_BAC_Export.xlsx"
     if stale.exists():
         stale.unlink()
@@ -102,9 +120,60 @@ def reset_all() -> None:
         conn.execute("UPDATE proposals SET status = ?, current_level = 1, "
                      "reviewer_note = NULL, approver_note = NULL", (PENDING_L1,))
         conn.execute("DELETE FROM approvals")
+        conn.execute("DELETE FROM proposal_revisions")
+
+
+# ====== EDITS ======
+
+# What a reviewer is allowed to change before signing off. Anything not listed here is
+# the system's own record of what it decided and why — `rationale`, `candidates`,
+# `confidence` and every `existing_*` snapshot are never rewritten by a human, or the
+# audit trail stops being evidence of what the engine actually proposed.
+EDITABLE = {
+    "proposed_test_description": "Proposed test",
+    "proposed_exception_description": "Proposed exception",
+    "risk_rating": "Risk rating",
+    "department": "Audit department",
+}
+
+
+def edit(proposal_id: int, field: str, new_value: str, level: int,
+         note: str = "") -> bool:
+    """Record one human edit. Returns False if nothing actually changed.
+
+    The old value is written to `proposal_revisions` BEFORE the proposal is updated, so
+    the chain from what the engine proposed to what was approved is always recoverable.
+    """
+    if field not in EDITABLE:
+        raise ValueError(f"{field} is not editable")
+
+    row = store.one(f"SELECT {field} AS value FROM proposals WHERE id = ?", (proposal_id,))
+    old_value = (row or {}).get("value") or ""
+    if (new_value or "").strip() == old_value.strip():
+        return False
+
+    with store.connect() as conn:
+        store.insert(conn, "proposal_revisions", {
+            "proposal_id": proposal_id, "field": field,
+            "old_value": old_value, "new_value": new_value,
+            "changed_by": "reviewer (level 1)" if level == 1 else "approver (level 2)",
+            "level": level, "note": note,
+            "changed_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        conn.execute(f"UPDATE proposals SET {field} = ? WHERE id = ?",
+                     (new_value, proposal_id))
+    return True
+
+
+def revisions(proposal_id: int) -> list[dict]:
+    """Every human edit to one proposal, oldest first — field, old value, new value, who, when."""
+    return store.query(
+        "SELECT field, old_value, new_value, changed_by, note, changed_at "
+        "FROM proposal_revisions WHERE proposal_id = ? ORDER BY id", (proposal_id,))
 
 
 def history(proposal_id: int) -> list[dict]:
+    """Every sign-off decision on one proposal, oldest first."""
     return store.query(
         "SELECT level, decision, note, decided_at FROM approvals "
         "WHERE proposal_id = ? ORDER BY id", (proposal_id,))
@@ -131,10 +200,14 @@ def export_eaudit() -> tuple[Path | None, list[str]]:
     approved = store.query(
         "SELECT p.*, d.filename, d.title FROM proposals p "
         "JOIN documents d ON d.id = p.document_id "
-        "WHERE p.status = ? AND p.change_type != 'No action' ORDER BY p.id", (APPROVED,))
+        f"WHERE p.status = ? AND {store.is_change('p')} ORDER BY p.id",
+        (APPROVED,))
 
     unapproved = store.query(
-        "SELECT sr_no, status FROM proposals WHERE status != ? AND change_type != 'No action'",
+        # A withdrawn proposal is not an outstanding approval — its circular was
+        # reissued and it never needed a decision. Listing it as a refusal would
+        # block an export for work nobody is expected to do.
+        f"SELECT sr_no, status FROM proposals WHERE status != ? AND {store.IS_CHANGE}",
         (APPROVED,))
     refusals = [f"{r['sr_no']} — {r['status']}" for r in unapproved]
 

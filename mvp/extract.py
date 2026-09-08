@@ -78,6 +78,11 @@ _REVIEW_MARKUP = re.compile(
 
 
 def find_soffice() -> Path | None:
+    """Path to LibreOffice, or None. Used to convert legacy .doc/.xls/.ppt before reading.
+
+    Absence is not an error: those formats are simply reported as unreadable, with the
+    reason, rather than failing the run.
+    """
     for path in SOFFICE_PATHS:
         if path.exists():
             return path
@@ -123,6 +128,13 @@ def ocr_image(image) -> str:
 # ====== READERS ======
 
 def read_pdf(path: Path) -> Extracted:
+    """Read a PDF, deciding OCR PER PAGE.
+
+    A page with a healthy text layer is read directly; a page without one is rendered
+    and OCR'd. Deciding for the whole document is the trap: a mixed PDF then either
+    wastes OCR on clean pages or returns nothing for the scanned ones, and both are
+    silent. `kind` reports which happened — native-pdf, scanned-pdf or mixed-pdf.
+    """
     from pypdf import PdfReader
 
     reader = PdfReader(str(path))
@@ -162,25 +174,54 @@ def _poppler():
 
 
 def read_image(path: Path) -> Extracted:
+    """OCR a single image. Returns an Extracted whose `ocr_pages` is 1."""
     from PIL import Image
 
     return Extracted(text=_clean(ocr_image(Image.open(path))), pages=1,
                      kind="image", ocr_pages=1)
 
 
+def table_row(number: int, cells: list[str]) -> str:
+    """One table row, in the single format every reader emits and the splitter understands.
+
+    `[row 4] A-1 | Banks shall ... | 01-Oct`
+
+    All three readers that meet tables — Word, Excel and PowerPoint — go through here, and
+    that is the point. `segment.py` splits on the `[row N]` marker, so a reader that emits
+    a bare `A | B | C` line instead produces rows the splitter cannot see: they are not
+    made into clauses, and worse, they are GLUED ONTO THE END of whatever clause came
+    before, corrupting its text and its retrieval. That is what Word did until this
+    function existed, silently, on every circular with a table in it.
+
+    `number` is the sheet row for a spreadsheet, where it is a real coordinate a reviewer
+    can navigate to. For Word and PowerPoint it is a running count of rows in the
+    document, which is only a locator — but `segment._row_ref` prefers the row's own
+    reference from its first cell whenever there is one, so this rarely surfaces.
+    """
+    return f"[row {number}] " + " | ".join(cells)
+
+
 def read_docx(path: Path) -> Extracted:
+    """Read a Word file: paragraphs AND table rows.
+
+    Tables matter — obligations in SBP circulars are routinely inside them, and a reader
+    that walks only paragraphs loses those clauses without any error.
+    """
     from docx import Document
 
     document = Document(str(path))
     parts = [p.text for p in document.paragraphs if p.text.strip()]
 
     # Tables carry obligations routinely — a row is often one requirement. Keep the row
-    # structure with a separator rather than flattening it into prose.
+    # structure with a separator rather than flattening it into prose, and tag each row
+    # with the SAME `[row N]` marker the spreadsheet reader uses (see `table_row`).
+    row_number = 0
     for table in document.tables:
         for row in table.rows:
             cells = [c.text.strip() for c in row.cells if c.text.strip()]
             if cells:
-                parts.append(" | ".join(cells))
+                row_number += 1
+                parts.append(table_row(row_number, cells))
 
     result = Extracted(text=_clean("\n".join(parts)), pages=1, kind="docx")
     result.children = _embedded_in_ooxml(path)
@@ -188,6 +229,11 @@ def read_docx(path: Path) -> Extracted:
 
 
 def read_excel(path: Path) -> Extracted:
+    """Read every sheet and row, keeping the row number with the text.
+
+    The `[row 14]` marker travels with the clause so a reviewer can find it again, and
+    segment.py uses it as a clause boundary — one requirement per row.
+    """
     from openpyxl import load_workbook
 
     wb = load_workbook(str(path), read_only=True, data_only=True)
@@ -200,12 +246,51 @@ def read_excel(path: Path) -> Extracted:
             if cells:
                 # The row reference travels with the text so a reviewer can find it
                 # again — "Annexure A · row 14" rather than "somewhere in the sheet".
-                blocks.append(f"[row {number}] " + " | ".join(cells))
+                blocks.append(table_row(number, cells))
     return Extracted(text=_clean("\n".join(blocks)), pages=len(wb.sheetnames),
                      kind="excel")
 
 
+def _pptx_shape_text(shape, out: list, counter: list) -> None:
+    """Append every piece of text a slide shape carries. Recurses into groups.
+
+    Three shape kinds hold text and they are NOT interchangeable:
+
+    * a text box or placeholder — `has_text_frame`
+    * a TABLE — no text frame at all, so a `has_text_frame` check drops it in silence.
+      Obligations arrive in tables constantly, exactly as they do in Word, and a briefing
+      deck's control matrix is usually the only part worth reading.
+    * a GROUP — shapes dragged together. Its children are not in `slide.shapes`, so
+      anything grouped is invisible unless you descend into it.
+
+    Missing any of these loses clauses with no error, which is worse than failing to read
+    the file at all: the deck reports as ingested and the obligations are simply absent.
+    """
+    if shape.shape_type == 6:                       # MSO_SHAPE_TYPE.GROUP
+        for child in shape.shapes:
+            _pptx_shape_text(child, out, counter)
+        return
+    if getattr(shape, "has_table", False):
+        for row in shape.table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                # Through the shared helper, so a slide table row reaches the splitter as
+                # a row and not as text glued to the previous clause.
+                counter[0] += 1
+                out.append(table_row(counter[0], cells))
+        return
+    if shape.has_text_frame and shape.text_frame.text.strip():
+        out.append(shape.text_frame.text)
+
+
 def read_pptx(path: Path) -> Extracted:
+    """Slide text, slide tables and speaker notes. Returns an error result if python-pptx
+    is absent, rather than raising — an optional dependency must not fail the batch.
+
+    Text drawn INTO a slide as a picture is not read: this is a text extractor, not OCR.
+    A deck that is entirely screenshots comes back nearly empty and is flagged by the
+    split check rather than passing as a document with no obligations in it.
+    """
     try:
         from pptx import Presentation
     except ImportError:
@@ -213,17 +298,23 @@ def read_pptx(path: Path) -> Extracted:
                          kind="pptx")
     prs = Presentation(str(path))
     parts = []
+    counter = [0]                       # running table-row number across the whole deck
     for index, slide in enumerate(prs.slides, start=1):
         parts.append(f"### SLIDE {index}")
         for shape in slide.shapes:
-            if shape.has_text_frame and shape.text_frame.text.strip():
-                parts.append(shape.text_frame.text)
+            _pptx_shape_text(shape, parts, counter)
         if slide.has_notes_slide and slide.notes_slide.notes_text_frame.text.strip():
+            # Speaker notes carry the instruction the slide only summarises often enough
+            # to be worth reading. Labelled, so a reviewer can see where it came from.
             parts.append("Notes: " + slide.notes_slide.notes_text_frame.text)
     return Extracted(text=_clean("\n".join(parts)), pages=len(prs.slides), kind="pptx")
 
 
 def read_msg(path: Path) -> Extracted:
+    """Read an Outlook .msg: header, body and attachments. Attachments become children.
+
+    Returns an error result if extract-msg is absent, rather than raising.
+    """
     try:
         import extract_msg
     except ImportError:
@@ -244,6 +335,9 @@ def read_msg(path: Path) -> Extracted:
 
 
 def read_text(path: Path) -> Extracted:
+    """Read text, HTML, RTF or CSV, decoding with a fallback so an unusual encoding
+    produces text rather than an exception.
+    """
     raw = path.read_text(encoding="utf-8", errors="replace")
     if path.suffix.lower() in {".htm", ".html"}:
         raw = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw, flags=re.S | re.I)
@@ -254,6 +348,11 @@ def read_text(path: Path) -> Extracted:
 
 
 def read_eml(path: Path) -> Extracted:
+    """Read an email: body plus attachments, each attachment extracted as a child document.
+
+    ABL confirmed RIA content arrives either in the body or attached, so both are read
+    and the route is recorded on the document.
+    """
     import email
 
     message = email.message_from_bytes(path.read_bytes())
@@ -466,6 +565,21 @@ def read(path: Path, _depth: int = 0, _seen: set | None = None) -> Extracted:
         result.text = result.text[:MAX_TOTAL_CHARS]
         result.error = (result.error + " | " if result.error else "") + \
             f"truncated at {MAX_TOTAL_CHARS:,} characters"
+
+    # ===== DEBUG PRINTS — delete this block when you are done =====
+    _flat = result.text.replace("\n", " / ")
+    print(f"[EXTRACT] {path.name}")
+    print(f"[EXTRACT]   ext {path.suffix.lower()} -> sniffed {suffix}   kind={result.kind}")
+    print(f"[EXTRACT]   pages={result.pages}  chars={len(result.text):,}  "
+          f"ocr_pages={result.ocr_pages}  error={result.error or '-'}")
+    # Head AND tail. A reader that stopped early looks perfectly fine from the head.
+    print(f"[EXTRACT]   head: {_flat[:200]}")
+    print(f"[EXTRACT]   tail: {_flat[-200:]}")
+    for _name, _child in result.children:
+        print(f"[EXTRACT]   embedded: {_name} -> {_child.kind}, "
+              f"{len(_child.text):,} chars, error={_child.error or '-'}")
+    # ===== END DEBUG PRINTS =====
+
     return result
 
 
@@ -477,6 +591,12 @@ _DATE = re.compile(
 
 
 def guess_title(text: str, filename: str) -> str:
+    """A human-readable title from the first lines, falling back to the filename.
+
+    This is what the UI shows, and it matters most for EMBEDDED files: Word names them
+    `oleObject1.bin`, so without a detected title a reviewer cannot tell one annexure
+    from another.
+    """
     for line in (text or "").split("\n")[:25]:
         # A spreadsheet's first line arrives as "[row 1] ANNEXURE A — ...". The row
         # marker belongs in the clause text and is noise in a title.
@@ -494,5 +614,8 @@ def guess_title(text: str, filename: str) -> str:
 
 
 def guess_date(text: str) -> str:
+    """The first date that looks like a circular date, or "". Searched near the top only,
+    so a date inside the body cannot be mistaken for the document's own.
+    """
     match = _DATE.search((text or "")[:2500])
     return match.group(1) if match else ""
