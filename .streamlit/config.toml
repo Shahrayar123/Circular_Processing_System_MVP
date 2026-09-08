@@ -1,0 +1,42 @@
+# Allied Bank theme — blue and white, taken from the brand logo (ABL.PK_BIG.svg):
+#   navy   #013b82   orange  #f36f21
+# Native Streamlit theming only (see the theming reference). No custom CSS.
+
+[theme]
+base = "light"
+primaryColor = "#013b82"              # Allied Bank navy — buttons, links, active elements
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#eef3fa"  # widget backgrounds, metric cards, code blocks
+textColor = "#0f2540"
+linkColor = "#013b82"
+borderColor = "#d2ddec"
+codeBackgroundColor = "#eef3fa"
+codeTextColor = "#013b82"
+
+baseRadius = "6px"
+buttonRadius = "6px"
+showWidgetBorder = true
+showSidebarBorder = true
+linkUnderline = false
+
+font = "sans-serif"
+headingFontWeights = [700, 700, 600, 600, 600, 600]
+
+# Semantic palette — green new / amber amendment / red deletion kept meaningful,
+# neutral blue is the brand navy, and the brand orange leads the chart palette accents.
+blueColor = "#013b82"
+orangeColor = "#f36f21"
+grayColor = "#64757a"
+
+chartCategoricalColors = ["#013b82", "#2f6bb3", "#7aa5d8", "#f36f21", "#1a7f37", "#b03a30", "#64757a"]
+chartSequentialColors  = ["#eef3fa", "#d3e1f2", "#b3cbe8", "#8fb2dc", "#6a97cf", "#487cbe", "#2f63a6", "#1e4c88", "#123c6e", "#0a2c56"]
+
+dataframeHeaderBackgroundColor = "#eef3fa"
+
+[theme.sidebar]
+backgroundColor = "#013b82"
+secondaryBackgroundColor = "#0a4a97"
+codeBackgroundColor = "#0a4a97"
+textColor = "#ffffff"
+borderColor = "#1b5aa8"
+primaryColor = "#f36f21"
