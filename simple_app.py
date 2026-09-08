@@ -66,15 +66,38 @@ def proposals(status: str | list[str] | None = None) -> pd.DataFrame:
     return pd.DataFrame(store.query(sql, params))
 
 
+def _change_column(df: pd.DataFrame) -> pd.Series:
+    """What this proposal asks the reviewer to accept, in one cell.
+
+    A New or an Amendment proposes wording, so that is what goes here. A DELETION proposes
+    no wording at all — it removes a test — and the cell was therefore left empty, which
+    told the reviewer nothing and looked like missing data.
+
+    Worse than looking empty: the row showed only the test CODE, so a reviewer was being
+    asked to approve removing a control without seeing what the control said. Deletions
+    are the highest-consequence change this system makes and the one it must never
+    auto-approve; the description is already stored frozen on the proposal, so show it.
+    """
+    proposed = df["proposed_test_description"].fillna("")
+    removing = ("Remove — " + df["existing_test_description"].fillna("(test wording not "
+                                                                    "recorded)"))
+    return proposed.where(df["change_type"] != "Deletion", removing)
+
+
 def table(df: pd.DataFrame, pick_column: str | None = None) -> pd.DataFrame:
     """Render the proposed changes as a table. Returns the edited frame if pickable."""
     view = pd.DataFrame({
         "Sr #": df["sr_no"],
         "Change type": df["change_type"],
         "Dept": df["department"],
+        # The clause the circular actually says, next to what we propose to do about it.
+        # Every proposal cites its source clause — that is the grounding rule — and a
+        # reviewer cannot check a proposal against a citation they have to go and look up.
+        # It matters most for a DELETION, where the clause is the withdrawal itself
+        # ("... shall stand withdrawn") and is the only evidence the removal is justified.
+        "From the circular": df["clause_text"].fillna(""),
         "Existing test": df["target_test_code"].fillna("—"),
-        "Proposed test / change": df["proposed_test_description"].fillna(""),
-        "Risk": df["risk_rating"].fillna(""),
+        "Proposed test / change": _change_column(df),
         "Circular": df["circular"],
         "Clause": df["clause_ref"].fillna(""),
         "Status": df["status"],
@@ -95,6 +118,9 @@ def table(df: pd.DataFrame, pick_column: str | None = None) -> pd.DataFrame:
         disabled=[c for c in view.columns if c not in editable],
         column_config={
             pick_column: st.column_config.CheckboxColumn(pick_column, width="small"),
+            # Read-only by construction: it is not in `editable`. The circular's own words
+            # are evidence, and evidence a reviewer can retype is not evidence.
+            "From the circular": st.column_config.TextColumn(width="large"),
             "Proposed test / change": st.column_config.TextColumn(width="large"),
         },
         # The key carries the queue length: after a sign-off the queue is shorter, and
@@ -269,6 +295,12 @@ elif step == STEPS[1]:
         # audit trail exists to prevent.
         amended = 0
         for position, proposal_id in enumerate(df["id"]):
+            # A Deletion's cell shows what is being REMOVED, not wording being proposed.
+            # Saving it back would write "Remove — Check that ..." into
+            # proposed_test_description and it would reach the eAudit export as though a
+            # reviewer had drafted it.
+            if df["change_type"].iloc[position] == "Deletion":
+                continue
             new_text = str(edited["Proposed test / change"].iloc[position] or "")
             if review.edit(int(proposal_id), "proposed_test_description", new_text,
                            level=1, note=note):
