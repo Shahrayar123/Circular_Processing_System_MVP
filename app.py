@@ -18,7 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mvp import config, review, store  # noqa: E402
 
-st.set_page_config(page_title="AuditPilot MVP", page_icon="📑", layout="wide")
+LOGO = Path(__file__).resolve().parent / ".streamlit" / "ABL.PK_BIG.svg"
+
+st.set_page_config(page_title="Circular Processing System — Allied Bank",
+                   page_icon="📑", layout="wide")
+st.logo(str(LOGO), size="large", link="https://www.abl.com")
 
 COLOUR = {"New": "#2E7A4F", "Amendment": "#9C6F11", "Deletion": "#B03A30",
           "No action": "#64757A"}
@@ -155,7 +159,7 @@ with tab1:
                        f"WHERE {store.IS_CHANGE} "
                        "GROUP BY change_type ORDER BY n DESC")
         if not by_type.empty:
-            st.bar_chart(by_type.set_index("change_type"), color="#0E6E6E", height=240)
+            st.bar_chart(by_type.set_index("change_type"), color="#013b82", height=240)
             for _, row in by_type.iterrows():
                 st.markdown(f"{chip(row['change_type'], COLOUR.get(row['change_type'], '#555'))}"
                             f" &nbsp; {row['n']}", unsafe_allow_html=True)
@@ -337,7 +341,7 @@ with tab2:
             if not cl["is_actionable"] and not show_all:
                 continue
             tag = ("Actionable" if cl["is_actionable"] else "For information only")
-            colour = "#0E6E6E" if cl["is_actionable"] else "#64757A"
+            colour = "#013b82" if cl["is_actionable"] else "#64757A"
             st.markdown(
                 f"{chip(tag, colour)} &nbsp; **{cl['clause_ref']}** &nbsp; "
                 f"<span style='color:#64757A;font-size:12px'>page {cl['page_number']} · "
@@ -478,7 +482,7 @@ with tab3:
         with left:
             st.markdown("**The clause**")
             st.markdown(
-                f"<div style='border-left:3px solid #0E6E6E;padding:8px 0 8px 12px;"
+                f"<div style='border-left:3px solid #013b82;padding:8px 0 8px 12px;"
                 f"font-size:14px'>{p['clause_text'][:1400]}</div>", unsafe_allow_html=True)
 
         with right:
@@ -519,7 +523,7 @@ with tab3:
         st.divider()
         status = p.get("status", review.PENDING_L1) or review.PENDING_L1
         st.markdown(f"**Level 1 decision** &nbsp; "
-                    f"{chip(status, '#0E6E6E' if status == 'Approved' else '#9C6F11')}",
+                    f"{chip(status, '#013b82' if status == 'Approved' else '#9C6F11')}",
                     unsafe_allow_html=True)
         note = st.text_input("Reviewer note (optional)", key=f"note{pick}")
         b1, b2, b3, b4, _ = st.columns([1, 1, 1.4, 1.2, 2])
@@ -648,7 +652,7 @@ with tab4:
 
         col1, col2 = st.columns(2)
         col1.markdown("**Source clause**")
-        col1.markdown(f"<div style='border-left:3px solid #0E6E6E;padding:8px 0 8px 12px;"
+        col1.markdown(f"<div style='border-left:3px solid #013b82;padding:8px 0 8px 12px;"
                       f"font-size:14px'>{q['clause_text'][:900]}</div>",
                       unsafe_allow_html=True)
         col2.markdown(f"**Proposed** &nbsp; "
@@ -663,7 +667,7 @@ with tab4:
         note_line = ("<br>Reviewer note: " + str(q["reviewer_note"])
                      if q["reviewer_note"] else "")
         col2.markdown(
-            "<div style='background:#0E6E6E14;border-left:3px solid #0E6E6E;"
+            "<div style='background:#013b8214;border-left:3px solid #013b82;"
             "padding:8px 12px;margin-top:8px;font-size:13px'>"
             "<b>Approved by the reviewer at level 1</b>"
             + ("  ·  " + when if when else "") + note_line + "</div>",

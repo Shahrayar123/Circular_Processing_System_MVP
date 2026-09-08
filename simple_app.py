@@ -24,8 +24,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mvp import config, review, store  # noqa: E402
 
-st.set_page_config(page_title="Circular Processing System",
+LOGO = Path(__file__).resolve().parent / ".streamlit" / "ABL.PK_BIG.svg"
+
+st.set_page_config(page_title="Circular Processing System — Allied Bank",
                    page_icon="✅", layout="wide")
+st.logo(str(LOGO), size="large", link="https://www.abl.com")
 
 COLOUR = {"New": "#2E7A4F", "Amendment": "#9C6F11", "Deletion": "#B03A30",
           "No action": "#64757A"}
