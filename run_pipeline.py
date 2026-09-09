@@ -200,9 +200,18 @@ def propose_changes(engine: str) -> None:
         # that would actually destroy something.
         print("   every obligation already has a proposal — existing proposals, edits "
               "and approvals left untouched")
-    if summary["dropped_invalid_code"]:
-        print(f"   {summary['dropped_invalid_code']} proposal(s) dropped — "
-              f"cited test code not in the library")
+    # What the grounding gate corrected, if anything. Printed because a correction is not
+    # a tidy-up: each one is a decision an engine got wrong in a way that would have
+    # reached a reviewer, and the counts are how you notice an engine degrading.
+    REASONS = {
+        "unknown_type":   "change type not recognised",
+        "invented_code":  "cited test code not in the library",
+        "missing_target": "Amendment or Deletion with no test to act on",
+        "empty_change":   "Amendment proposed the existing wording unchanged",
+        "recovered_by_rules": "re-decided by the rules engine rather than dropped",
+    }
+    for reason, count in sorted(summary["corrected"].items()):
+        print(f"   {count} proposal(s) corrected — {REASONS.get(reason, reason)}")
 
 
 # ====== STAGE 5 · OUTPUTS ======
@@ -369,6 +378,9 @@ def main() -> int:
     print("  AuditPilot MVP — demonstration run")
     print("  Dummy 500-test library · ABL's own documents · no live systems")
     print("=" * 66)
+    # Say what this run is configured to do. Without it, "judged by the model" in the
+    # output does not say WHICH model, and a run in a screenshot cannot be reproduced.
+    print(f"  {config.describe(judge=args.judge, engine=args.engine)}")
     # Both flags wipe; only --reset goes on to rebuild. The generated files go with the
     # database either way: document ids restart at 1, so leaving them would put a stale
     # "01_..." next to the new one with nothing to tell them apart.

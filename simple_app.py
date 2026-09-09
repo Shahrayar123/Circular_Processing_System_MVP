@@ -22,7 +22,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mvp import config, review, store  # noqa: E402
+from mvp import config, excel_out, review, store  # noqa: E402
 
 LOGO = Path(__file__).resolve().parent / ".streamlit" / "ABL.PK_BIG.svg"
 
@@ -69,15 +69,38 @@ def proposals(status: str | list[str] | None = None) -> pd.DataFrame:
     return pd.DataFrame(store.query(sql, params))
 
 
+def _change_column(df: pd.DataFrame) -> pd.Series:
+    """What this proposal asks the reviewer to accept, in one cell.
+
+    A New or an Amendment proposes wording, so that is what goes here. A DELETION proposes
+    no wording at all — it removes a test — and the cell was therefore left empty, which
+    told the reviewer nothing and looked like missing data.
+
+    Worse than looking empty: the row showed only the test CODE, so a reviewer was being
+    asked to approve removing a control without seeing what the control said. Deletions
+    are the highest-consequence change this system makes and the one it must never
+    auto-approve; the description is already stored frozen on the proposal, so show it.
+    """
+    proposed = df["proposed_test_description"].fillna("")
+    removing = ("Remove — " + df["existing_test_description"].fillna("(test wording not "
+                                                                    "recorded)"))
+    return proposed.where(df["change_type"] != "Deletion", removing)
+
+
 def table(df: pd.DataFrame, pick_column: str | None = None) -> pd.DataFrame:
     """Render the proposed changes as a table. Returns the edited frame if pickable."""
     view = pd.DataFrame({
         "Sr #": df["sr_no"],
         "Change type": df["change_type"],
         "Dept": df["department"],
+        # The clause the circular actually says, next to what we propose to do about it.
+        # Every proposal cites its source clause — that is the grounding rule — and a
+        # reviewer cannot check a proposal against a citation they have to go and look up.
+        # It matters most for a DELETION, where the clause is the withdrawal itself
+        # ("... shall stand withdrawn") and is the only evidence the removal is justified.
+        "From the circular": df["clause_text"].fillna(""),
         "Existing test": df["target_test_code"].fillna("—"),
-        "Proposed test / change": df["proposed_test_description"].fillna(""),
-        "Risk": df["risk_rating"].fillna(""),
+        "Proposed test / change": _change_column(df),
         "Circular": df["circular"],
         "Clause": df["clause_ref"].fillna(""),
         "Status": df["status"],
@@ -98,6 +121,9 @@ def table(df: pd.DataFrame, pick_column: str | None = None) -> pd.DataFrame:
         disabled=[c for c in view.columns if c not in editable],
         column_config={
             pick_column: st.column_config.CheckboxColumn(pick_column, width="small"),
+            # Read-only by construction: it is not in `editable`. The circular's own words
+            # are evidence, and evidence a reviewer can retype is not evidence.
+            "From the circular": st.column_config.TextColumn(width="large"),
             "Proposed test / change": st.column_config.TextColumn(width="large"),
         },
         # The key carries the queue length: after a sign-off the queue is shorter, and
@@ -272,6 +298,12 @@ elif step == STEPS[1]:
         # audit trail exists to prevent.
         amended = 0
         for position, proposal_id in enumerate(df["id"]):
+            # A Deletion's cell shows what is being REMOVED, not wording being proposed.
+            # Saving it back would write "Remove — Check that ..." into
+            # proposed_test_description and it would reach the eAudit export as though a
+            # reviewer had drafted it.
+            if df["change_type"].iloc[position] == "Deletion":
+                continue
             new_text = str(edited["Proposed test / change"].iloc[position] or "")
             if review.edit(int(proposal_id), "proposed_test_description", new_text,
                            level=1, note=note):
@@ -325,28 +357,53 @@ elif step == STEPS[2]:
 
 else:
     approved = proposals(review.APPROVED)
-    st.markdown("**Excel export — approved changes only.**")
+    st.markdown("**Two Excel files come out of this, and they are not the same file.**")
     st.caption(
-        "The formatted hand-off file for eAudit. It contains the approved changes and "
-        "nothing else: anything still waiting for a sign-off is named below and left "
-        "out. Excel is an output here, not the database — editing the downloaded file "
+        "Excel is an output here, not the database — editing either downloaded file "
         "changes nothing in the system.")
 
-    if approved.empty:
-        st.warning("Nothing has been approved yet, so there is nothing to export.")
-    else:
-        table(approved)
-
-    path, refusals = review.export_eaudit()
+    st.markdown("| File | What it holds |\n"
+        "|---|---|\n"
+        "| **Audit Checklist Working File** | Every proposed change under review, "
+        "approved or not |\n"
+        "| **eAudit BAC Export** | Approved changes ONLY, the quarterly hand-off |\n")
     st.write("")
 
-    if path:
+    # The working file is regenerated on the spot, so what downloads is the current
+    # state of the review rather than whatever the last pipeline run happened to leave
+    # on disk — someone may have approved three more changes since.
+    working = excel_out.build()
+    # Every proposed change, not just the approved ones — that is what the working file
+    # is for, and the count on the button has to match what is inside it.
+    all_changes = proposals()
+    left, right = st.columns(2)
+    with left:
         st.download_button(
-            f"Download the eAudit export — {len(approved)} approved change(s)",
-            data=path.read_bytes(), file_name=path.name, type="primary",
+            f"Download the working file — {len(all_changes)} proposed change(s)",
+            data=working.read_bytes(), file_name=working.name, type="primary",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.caption(f"Written to `{path}` — formatted headings, column widths, one row "
-                   f"per approved change, each carrying who approved it and when.")
+        st.caption(f"`{working.name}` — Summary, Proposed Tests, Annexure and Week MIS, "
+                   f"laid out exactly as ABL's own working file.")
+
+    path, refusals = review.export_eaudit()
+    with right:
+        if path:
+            st.download_button(
+                f"Download the eAudit export — {len(approved)} approved change(s)",
+                data=path.read_bytes(), file_name=path.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.caption(f"`{path.name}` — one row per approved change, each carrying who "
+                       f"approved it and when. **One sheet by design.**")
+        else:
+            st.button("Download the eAudit export", disabled=True)
+            st.caption("Nothing approved yet, so there is nothing to hand off.")
+
+    st.write("")
+    if approved.empty:
+        st.warning("Nothing has been approved yet. The working file below still contains "
+                   "every proposed change; the eAudit export would be empty.")
+    else:
+        table(approved)
 
     if refusals:
         with st.expander(f"Held back — {len(refusals)} change(s) not yet approved"):

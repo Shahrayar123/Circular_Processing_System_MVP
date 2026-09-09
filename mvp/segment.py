@@ -14,6 +14,7 @@ model is worse than one that never had the model.
 
 import json
 import re
+import time
 
 from . import config, store
 
@@ -377,26 +378,54 @@ THAT clause, at most six of them — never copy the example:
 
 
 def _judge_batch(texts: list[str]) -> list[dict] | None:
-    """Ask the model about several clauses at once. None if the call is unusable."""
+    """Ask the model about several clauses at once. None once every attempt is used up.
+
+    Retried up to `config.LLM_ATTEMPTS` times. Both failure modes are worth retrying and
+    for the same reason — a 7B model's bad reply is usually a bad SAMPLE, not a bad
+    prompt, so the next attempt often succeeds on identical input:
+
+    * the call itself failed — a timeout, a dropped connection, an HTTP error
+    * the reply came back unusable — not JSON, or the wrong number of verdicts, which
+      `_parse_verdicts` refuses rather than padding
+
+    Every retry is printed. A run that silently retried twice and then fell back looks
+    exactly like one that worked first time, and the difference is what tells you whether
+    the model is healthy.
+    """
     import httpx
 
     listing = "\n\n".join(f"{i}. {t[:JUDGE_INPUT_CHARS]}"
                            for i, t in enumerate(texts, start=1))
-    try:
-        response = httpx.post(
-            f"{config.OLLAMA_URL}/api/chat",
-            json={"model": config.OLLAMA_MODEL, "stream": False, "format": "json",
-                  "messages": [{"role": "user",
-                                "content": _JUDGE_PROMPT.format(
-                                    clauses=listing, count=len(texts))}],
-                  "options": {"temperature": 0}},
-            timeout=JUDGE_TIMEOUT)
-        response.raise_for_status()
-        content = response.json()["message"]["content"]
-    except Exception:
-        return None
+    payload = {"model": config.OLLAMA_MODEL, "stream": False, "format": "json",
+               "messages": [{"role": "user",
+                             "content": _JUDGE_PROMPT.format(
+                                 clauses=listing, count=len(texts))}],
+               "options": {"temperature": 0}}
 
-    return _parse_verdicts(content, len(texts))
+    for attempt in range(1, config.LLM_ATTEMPTS + 1):
+        why = ""
+        try:
+            response = httpx.post(f"{config.OLLAMA_URL}/api/chat", json=payload,
+                                  timeout=JUDGE_TIMEOUT)
+            response.raise_for_status()
+            verdicts = _parse_verdicts(response.json()["message"]["content"], len(texts))
+            if verdicts is not None:
+                if attempt > 1:
+                    print(f"   model call succeeded on attempt {attempt}")
+                return verdicts
+            why = f"reply unusable — expected {len(texts)} verdicts"
+        except Exception as exc:
+            why = f"{type(exc).__name__}: {exc}"
+
+        if attempt < config.LLM_ATTEMPTS:
+            wait = config.LLM_RETRY_BACKOFF * (2 ** (attempt - 1))
+            print(f"   model call failed (attempt {attempt}/{config.LLM_ATTEMPTS}): "
+                  f"{why[:90]} — retrying in {wait:.0f}s")
+            time.sleep(wait)
+        else:
+            print(f"   model call failed on all {config.LLM_ATTEMPTS} attempts: "
+                  f"{why[:90]} — falling back to the rules for this batch")
+    return None
 
 
 def _parse_verdicts(content: str, expected: int) -> list[dict] | None:
