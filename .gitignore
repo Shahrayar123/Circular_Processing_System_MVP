@@ -20,6 +20,9 @@ __pycache__/
 venv/
 .pytest_cache/
 
+# Local settings — .env.example is committed, .env is not
+.env
+
 # Editors / OS
 .vscode/
 .idea/

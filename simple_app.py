@@ -22,7 +22,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mvp import config, review, store  # noqa: E402
+from mvp import config, excel_out, review, store  # noqa: E402
 
 LOGO = Path(__file__).resolve().parent / ".streamlit" / "ABL.PK_BIG.svg"
 
@@ -357,28 +357,53 @@ elif step == STEPS[2]:
 
 else:
     approved = proposals(review.APPROVED)
-    st.markdown("**Excel export — approved changes only.**")
+    st.markdown("**Two Excel files come out of this, and they are not the same file.**")
     st.caption(
-        "The formatted hand-off file for eAudit. It contains the approved changes and "
-        "nothing else: anything still waiting for a sign-off is named below and left "
-        "out. Excel is an output here, not the database — editing the downloaded file "
+        "Excel is an output here, not the database — editing either downloaded file "
         "changes nothing in the system.")
 
-    if approved.empty:
-        st.warning("Nothing has been approved yet, so there is nothing to export.")
-    else:
-        table(approved)
-
-    path, refusals = review.export_eaudit()
+    st.markdown("| File | What it holds |\n"
+        "|---|---|\n"
+        "| **Audit Checklist Working File** | Every proposed change under review, "
+        "approved or not |\n"
+        "| **eAudit BAC Export** | Approved changes ONLY, the quarterly hand-off |\n")
     st.write("")
 
-    if path:
+    # The working file is regenerated on the spot, so what downloads is the current
+    # state of the review rather than whatever the last pipeline run happened to leave
+    # on disk — someone may have approved three more changes since.
+    working = excel_out.build()
+    # Every proposed change, not just the approved ones — that is what the working file
+    # is for, and the count on the button has to match what is inside it.
+    all_changes = proposals()
+    left, right = st.columns(2)
+    with left:
         st.download_button(
-            f"Download the eAudit export — {len(approved)} approved change(s)",
-            data=path.read_bytes(), file_name=path.name, type="primary",
+            f"Download the working file — {len(all_changes)} proposed change(s)",
+            data=working.read_bytes(), file_name=working.name, type="primary",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.caption(f"Written to `{path}` — formatted headings, column widths, one row "
-                   f"per approved change, each carrying who approved it and when.")
+        st.caption(f"`{working.name}` — Summary, Proposed Tests, Annexure and Week MIS, "
+                   f"laid out exactly as ABL's own working file.")
+
+    path, refusals = review.export_eaudit()
+    with right:
+        if path:
+            st.download_button(
+                f"Download the eAudit export — {len(approved)} approved change(s)",
+                data=path.read_bytes(), file_name=path.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.caption(f"`{path.name}` — one row per approved change, each carrying who "
+                       f"approved it and when. **One sheet by design.**")
+        else:
+            st.button("Download the eAudit export", disabled=True)
+            st.caption("Nothing approved yet, so there is nothing to hand off.")
+
+    st.write("")
+    if approved.empty:
+        st.warning("Nothing has been approved yet. The working file below still contains "
+                   "every proposed change; the eAudit export would be empty.")
+    else:
+        table(approved)
 
     if refusals:
         with st.expander(f"Held back — {len(refusals)} change(s) not yet approved"):

@@ -16,6 +16,7 @@ streamlit==1.41.1           # both UIs: app.py (full) and poc_app.py (simple)
 pandas==2.2.3               # tables in the UI
 numpy==2.2.1                # the TF-IDF vectors and cosine similarity
 rank-bm25==0.2.2            # the keyword half of retrieval
+python-dotenv==1.0.1        # reads MVP/.env — see .env.example
 
 # Reading circulars
 pypdf==5.1.0                # PDF text layer, page count
