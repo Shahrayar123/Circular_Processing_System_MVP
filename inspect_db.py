@@ -109,6 +109,16 @@ def show_clauses() -> None:
     print("\n   A clause judged by a FALLBACK is labelled as such. A run that quietly")
     print("   degraded to keyword rules must not look like one that used the model.")
 
+    print("\n   What the splitter DROPPED, by rule, and what the judge rescued. A rule that")
+    print("   keeps discarding obligations shows up here as rescues, not as missing proposals.")
+    try:
+        rows(store.query("SELECT rule, COUNT(*) AS fragments FROM dropped_fragments "
+                         "GROUP BY rule ORDER BY fragments DESC"))
+        rows(store.query("SELECT rescued_by, substr(text, 1, 70) AS text FROM clauses "
+                         "WHERE rescued_by IS NOT NULL"), limit=15)
+    except Exception:
+        print("   (this database predates dropped_fragments — run the pipeline once)")
+
     print()
     rows(store.query(
         "SELECT c.sequence, c.clause_ref, c.page_number, c.is_actionable, c.reason, "

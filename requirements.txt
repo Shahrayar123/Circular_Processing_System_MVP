@@ -45,3 +45,4 @@ pillow==11.0.0              # image handling for the above
 
 # Legacy .doc / .xls / .ppt are converted with LIBREOFFICE, which is not a pip
 # package — install it separately if those formats are in scope for the demo.
+beautifulsoup4             # HTML circulars and email bodies: paragraphs and tables kept in order

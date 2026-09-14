@@ -340,8 +340,14 @@ with tab2:
         for _, cl in clauses.iterrows():
             if not cl["is_actionable"] and not show_all:
                 continue
-            tag = ("Actionable" if cl["is_actionable"] else "For information only")
-            colour = "#013b82" if cl["is_actionable"] else "#64757A"
+            # NULL is a PROVISIONAL verdict (the model was unavailable), not "actionable" —
+            # pandas reads it as NaN, and NaN is truthy.
+            if pd.isna(cl["is_actionable"]):
+                tag, colour = "Not confirmed — model unavailable", "#B45F06"
+            elif cl["is_actionable"]:
+                tag, colour = "Actionable", "#013b82"
+            else:
+                tag, colour = "For information only", "#64757A"
             st.markdown(
                 f"{chip(tag, colour)} &nbsp; **{cl['clause_ref']}** &nbsp; "
                 f"<span style='color:#64757A;font-size:12px'>page {cl['page_number']} · "

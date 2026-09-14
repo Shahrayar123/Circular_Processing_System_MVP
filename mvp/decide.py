@@ -95,6 +95,19 @@ def _lower_first(text: str) -> str:
 
 
 def _proposed_wording(clause_text: str) -> str:
+    """Draft a 'Check that ...' test, carrying any table the clause depends on.
+
+    The sentence is drafted from the clause's own wording, and the table is appended under
+    it unchanged. Drafted from the whole text, the table's cells were cut into the
+    sentence by the "|" handling in `_draft_sentence` and then truncated — and a test
+    reading "above the limits given below" with nothing below it cannot be performed.
+    """
+    wording, rows = segment.split_table(clause_text)
+    sentence = _draft_sentence(wording)
+    return (sentence + "\n" + "\n".join(rows)) if rows else sentence
+
+
+def _draft_sentence(clause_text: str) -> str:
     """Draft a 'Check that ...' test from the clause, in ABL's house style."""
     text = clause_text.strip()
 
@@ -118,8 +131,16 @@ def _proposed_wording(clause_text: str) -> str:
         duty = subject[2].strip()
         # "X shall be duly filled" -> "X is duly filled", not "X duly filled". Dropping
         # the verb entirely leaves the test ungrammatical.
-        verb = "are" if re.search(r"(s|records|forms|documents)$", who.rstrip(".,"),
+        #
+        # Plural means a trailing "s" but not "ss": "any excess", "the business" and "the
+        # process" are singular, and "any excess are reported" is what a plain "s" wrote.
+        verb = "are" if re.search(r"((?<!s)s|records|forms|documents)$", who.rstrip(".,"),
                                   re.IGNORECASE) else "is"
+        # A NEGATIVE duty lost its verb the same way: "Branches shall not retain cash"
+        # became "Check that branches not retain cash". "not be" takes the same is/are
+        # as above; a plain "not" needs do/does.
+        duty = re.sub(r"^not\s+(be|been)\s+", f"{verb} not ", duty)
+        duty = re.sub(r"^not\s+", ("do" if verb == "are" else "does") + " not ", duty)
         duty = re.sub(r"^(be|been)\s+", f"{verb} ", duty)
         sentence = f"Check that {_lower_first(who)} {duty}"
     else:
@@ -139,7 +160,25 @@ def _proposed_wording(clause_text: str) -> str:
     return sentence + "."
 
 
+def _carry_attached_lines(proposed: str | None, clause_text: str) -> str | None:
+    """The proposed wording, with the clause's attached lines — a table's rows — under it.
+
+    The rules engine drafts them in already (`_proposed_wording`). A model paraphrases the
+    clause and normally leaves the table out, so a reviewer was asked to approve a test
+    "within the limits given below" with nothing below it — the same gap in every format,
+    only on the model path. Lines the model did write are not repeated.
+    """
+    if not proposed:
+        return proposed
+    _, rows = segment.split_table(clause_text)
+    missing = [row for row in rows if row not in proposed]
+    return (proposed.rstrip() + "\n" + "\n".join(missing)) if missing else proposed
+
+
 def _exception_wording(proposed: str) -> str:
+    # The exception describes the test failing; it is one sentence, not a copy of the
+    # test's table. Only the first line is the drafted sentence.
+    proposed = proposed.split("\n")[0]
     body = proposed[len("Check that "):].rstrip(".") if proposed.startswith("Check that ") else proposed
     return f"{body[0].upper()}{body[1:]} — not complied with."
 
@@ -452,7 +491,8 @@ def _decide_ollama(clause: dict, candidates: list[dict]) -> dict:
                     f"model call failed on all {config.LLM_ATTEMPTS} attempts: {last}")
 
     change_type = _normalise_change_type(data.get("change_type"))
-    proposed = data.get("proposed_test_description") or None
+    proposed = _carry_attached_lines(data.get("proposed_test_description") or None,
+                                     clause["text"])
     rationale = str(data.get("rationale") or "")
 
     # Everything about the matched test comes from THE CANDIDATE THE MODEL NAMED, never
@@ -526,7 +566,9 @@ def _pending_obligations() -> list[dict]:
         "FROM obligations o "
         "JOIN clauses c ON c.id = o.clause_id "
         "JOIN documents d ON d.id = c.document_id "
-        "WHERE c.is_actionable = 1 "
+        # NULL is a PROVISIONAL verdict — the rules judged it while the model was down —
+        # and it is proposed on, flagged, rather than left invisible until the next run.
+        "WHERE (c.is_actionable = 1 OR c.is_actionable IS NULL) "
         "  AND o.id NOT IN (SELECT obligation_id FROM proposals "
         "                   WHERE obligation_id IS NOT NULL) "
         "ORDER BY c.document_id, c.sequence, o.sequence")
@@ -624,8 +666,11 @@ def _ground_decision(decision: dict, valid: set) -> str | None:
                                 f"on, and none was identified, so no change is proposed.")
         return "missing_target"
 
+    # Compared on the sentence only. The attached table lines are appended to every
+    # proposed test, so comparing the whole text would never find an echo of the existing
+    # wording once a clause had a table under it.
     if decision["change_type"] == "Amendment" and _same_wording(
-            decision.get("proposed_test_description"),
+            (decision.get("proposed_test_description") or "").split("\n")[0],
             decision.get("existing_test_description")):
         # A model asked to amend a test will sometimes return that test's own wording back.
         # Stored as-is it is an Amendment that changes nothing: a reviewer reads two
@@ -760,7 +805,9 @@ def decide_all(index, engine: str = None) -> dict:
     # Sr numbers continue from what is already there. Restarting at 1 would hand this
     # week's first proposal the same reference as last week's, and the reference is what
     # the audit team quotes in email.
-    already = store.scalar("SELECT COUNT(*) FROM proposals") or 0
+    # The highest id, not the count: re-judging a provisional clause deletes its proposals,
+    # and a count would then hand a new proposal an Sr number already in use.
+    already = store.scalar("SELECT COALESCE(MAX(id), 0) FROM proposals") or 0
 
     with store.connect() as conn:
         for position, clause in enumerate(obligations, start=already + 1):
@@ -775,6 +822,13 @@ def decide_all(index, engine: str = None) -> dict:
                 if recovered:
                     summary["corrected"]["recovered_by_rules"] = (
                         summary["corrected"].get("recovered_by_rules", 0) + 1)
+
+            if clause["is_actionable"] is None:
+                # The rules judged this clause because the model was unavailable. The
+                # proposal is made, and says so; the clause is re-judged next run.
+                decision["rationale"] += (" (Actionability NOT confirmed: the model was "
+                                          "unavailable, so keyword rules judged this "
+                                          "clause. It is re-judged on the next run.)")
 
             _debug_decision(clause, candidates, decision)
 

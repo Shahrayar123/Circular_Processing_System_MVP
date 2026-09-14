@@ -139,7 +139,10 @@ def _record(conn, *, filename, source, source_detail, hash_value, text, pages,
 
     outcome = {"status": status, "filename": filename, "document_id": doc_id,
                "chars": len(text), "pages": pages, "kind": kind,
-               "ocr_pages": ocr_pages, "error": error, "parent_id": parent_id}
+               "ocr_pages": ocr_pages, "error": error, "parent_id": parent_id,
+               # Whether the text has any structure of its own. Decided here, where the
+               # format is known, and carried to the splitter — which reads text, not files.
+               "unstructured": extract.is_unstructured(kind)}
 
     # A reissue changes work already in the reviewer's queue, so it is reported back to
     # the caller rather than handled quietly here.

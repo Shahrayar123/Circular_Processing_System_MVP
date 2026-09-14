@@ -92,7 +92,15 @@ CREATE TABLE IF NOT EXISTS clauses (
     -- Stored per clause, not per run: a single circular can be judged by the model for
     -- most of its clauses and fall back for one batch, and the reviewer should be able
     -- to see exactly which.
-    judged_by       TEXT
+    judged_by       TEXT,
+    -- Set when a splitting rule DISCARDED this text and the judge found an obligation in
+    -- it on its second pass: who rescued it, and the rule that had dropped it. A rescue
+    -- means a structural rule was wrong about real text — if they keep appearing, fix the
+    -- rule rather than relying on the rescue.
+    rescued_by      TEXT,
+    -- 1 for a data table kept whole as a clause of its own because no paragraph pointed to
+    -- it. Worth a reviewer's glance: it usually belongs to the clause just before it.
+    table_unattached INTEGER NOT NULL DEFAULT 0
 );
 
 -- A clause routinely carries SEVERAL duties in one sentence:
@@ -108,6 +116,17 @@ CREATE TABLE IF NOT EXISTS clauses (
 --
 -- The clause TEXT is never split: it stays the unit of traceability, with one reference,
 -- one page and one pair of offsets. Obligations are recorded AGAINST it.
+-- Everything the splitter discarded, and the rule that discarded it. A dropped fragment
+-- produces no clause, no proposal and no warning, so without this table a wrong rule is
+-- invisible: its only symptom would be an obligation nobody ever sees.
+CREATE TABLE IF NOT EXISTS dropped_fragments (
+    id              INTEGER PRIMARY KEY,
+    document_id     INTEGER NOT NULL,
+    char_start      INTEGER,
+    char_end        INTEGER,
+    text            TEXT NOT NULL,
+    rule            TEXT NOT NULL      -- too short | heading | page number | salutation …
+);
 CREATE TABLE IF NOT EXISTS obligations (
     id              INTEGER PRIMARY KEY,
     clause_id       INTEGER NOT NULL,
@@ -257,6 +276,8 @@ _ADDED_COLUMNS = [
     ("documents", "processed_at", "TEXT"),
     ("documents", "supersedes", "INTEGER"),
     ("documents", "superseded_by", "INTEGER"),
+    ("clauses", "rescued_by", "TEXT"),
+    ("clauses", "table_unattached", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -488,7 +509,37 @@ def clear_document_work(conn: sqlite3.Connection, document_id: int) -> bool:
     conn.execute("DELETE FROM obligations WHERE clause_id IN "
                  "(SELECT id FROM clauses WHERE document_id = ?)", (document_id,))
     conn.execute("DELETE FROM proposals WHERE document_id = ?", (document_id,))
+    conn.execute("DELETE FROM dropped_fragments WHERE document_id = ?", (document_id,))
     conn.execute("DELETE FROM clauses WHERE document_id = ?", (document_id,))
+    return True
+
+
+def clause_has_human_decisions(conn: sqlite3.Connection, clause_id: int) -> bool:
+    """True if a person has approved, rejected or edited any proposal from this clause.
+
+    The per-clause form of `has_human_decisions`, for re-judging one provisional clause
+    without touching work a reviewer has already done on it.
+    """
+    return bool(conn.execute(
+        "SELECT 1 FROM proposals p "
+        "WHERE p.clause_id = ? AND ("
+        "  p.status NOT IN (?, ?) "
+        "  OR EXISTS (SELECT 1 FROM approvals a WHERE a.proposal_id = p.id) "
+        "  OR EXISTS (SELECT 1 FROM proposal_revisions r WHERE r.proposal_id = p.id)) "
+        "LIMIT 1",
+        (clause_id, "Pending review", WITHDRAWN)).fetchone())
+
+
+def clear_clause_work(conn: sqlite3.Connection, clause_id: int) -> bool:
+    """Delete one clause's obligations and proposals so it can be judged again.
+
+    Returns False — and deletes nothing — if a human has acted on a proposal from it. Same
+    line as `clear_document_work`, one clause wide.
+    """
+    if clause_has_human_decisions(conn, clause_id):
+        return False
+    conn.execute("DELETE FROM proposals WHERE clause_id = ?", (clause_id,))
+    conn.execute("DELETE FROM obligations WHERE clause_id = ?", (clause_id,))
     return True
 
 
@@ -567,6 +618,15 @@ def approval_counts() -> dict:
     return {r["status"]: r["n"] for r in rows}
 
 
+def _count_or_zero(sql: str) -> int:
+    """A count that is 0 on a database written before its table or column existed,
+    rather than an error on a dashboard someone opened before re-running the pipeline."""
+    try:
+        return scalar(sql) or 0
+    except sqlite3.OperationalError:
+        return 0
+
+
 def counts() -> dict:
     """Every headline figure the dashboards show, in one query set.
 
@@ -602,6 +662,13 @@ def counts() -> dict:
             "GROUP BY clause_id HAVING COUNT(*) > 1)") or 0,
         "truncated_for_model": scalar("SELECT COUNT(*) FROM clauses "
                                       "WHERE model_input_truncated = 1") or 0,
+        # What the splitter discarded, what the judge brought back, what is still waiting
+        # for the model, and which tables arrived with no clause pointing to them.
+        "dropped": _count_or_zero("SELECT COUNT(*) FROM dropped_fragments"),
+        "rescued": _count_or_zero("SELECT COUNT(*) FROM clauses WHERE rescued_by IS NOT NULL"),
+        "provisional": _count_or_zero("SELECT COUNT(*) FROM clauses WHERE is_actionable IS NULL"),
+        "unattached_tables": _count_or_zero("SELECT COUNT(*) FROM clauses "
+                                            "WHERE table_unattached = 1"),
         "approved": scalar(f"SELECT COUNT(*) FROM proposals WHERE status = 'Approved' "
                            f"AND {_IS_CHANGE}") or 0,
         "pending": scalar("SELECT COUNT(*) FROM proposals "

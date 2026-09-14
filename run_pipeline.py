@@ -161,13 +161,19 @@ def extract_clauses(documents: list[dict], judge: str) -> None:
             # `doc` came from read_documents(), so the file's text is already in memory.
             # Passing it on rather than re-reading from disk keeps the file opened once
             # per run — and on a scanned circular a re-read would mean OCR'ing it twice.
+            # `unstructured` says the text came from PDF, OCR or plain text, where table
+            # rows have lost their columns and must be recognised by shape. Defaults to
+            # False — no guessing — for anything that does not say.
             summary = segment.segment_document(conn, doc["document_id"], doc["text"],
-                                               judge=judge)
+                                               judge=judge,
+                                               unstructured=doc.get("unstructured", False))
 
             # Every figure printed here comes back from segment_document, which had all
             # of them in hand. Nothing is queried back out of the database to print it.
             print(f"   {doc['filename'][:52]:<54} {summary['clauses']:>3} clauses, "
-                  f"{summary['actionable']:>3} actionable")
+                  f"{summary['actionable']:>3} actionable, "
+                  f"{summary['dropped']:>3} dropped as noise"
+                  + (f", {summary['rescued']} rescued" if summary["rescued"] else ""))
 
             # A split that looks wrong is reported HERE, next to the document it concerns
             # — not left for someone to infer later from a low clause count on a screen
@@ -181,6 +187,25 @@ def extract_clauses(documents: list[dict], judge: str) -> None:
             # complete, and every future run would skip it as already processed — losing
             # the circular silently, which is the worst failure this system has.
             store.mark_processed(conn, doc["document_id"])
+
+
+def rejudge_provisional_clauses(judge: str) -> list[int]:
+    """Ask the model again about clauses the rules judged while it was unreachable.
+
+    Returns the documents whose clauses changed, so their Word files are rewritten too.
+    Only with the model judge — re-judging with the rules would repeat the fallback.
+    """
+    if judge != "llm":
+        return []
+    with store.connect() as conn:
+        result = segment.rejudge_provisional(conn)
+    if result["queued"]:
+        banner("3b · Re-judging provisional verdicts")
+        print(f"   {result['queued']} clause(s) judged by the rules while the model was "
+              f"unavailable: {result['confirmed']} now judged by the model, "
+              f"{result['still_provisional']} still waiting, "
+              f"{result['kept_human']} left alone because a reviewer had already acted")
+    return result["documents"]
 
 
 # ====== STAGE 4 · PROPOSALS ======
@@ -216,7 +241,8 @@ def propose_changes(engine: str) -> None:
 
 # ====== STAGE 5 · OUTPUTS ======
 
-def write_outputs(documents: list[dict], regenerate_all: bool = False) -> None:
+def write_outputs(documents: list[dict], regenerate_all: bool = False,
+                  also: list[int] | None = None) -> None:
     """Write the Excel working file, and a Word document per circular THIS RUN processed.
 
     The two outputs have different scopes on purpose:
@@ -237,7 +263,10 @@ def write_outputs(documents: list[dict], regenerate_all: bool = False) -> None:
     excel = excel_out.build()
     print(f"   Excel  {excel.name}   (consolidated, always rebuilt)")
 
-    ids = None if regenerate_all else [d["document_id"] for d in documents]
+    # `also` is documents an earlier stage changed without re-reading them — a clause
+    # re-judged by the model — whose Word files are otherwise left stale.
+    ids = None if regenerate_all else list(dict.fromkeys(
+        [d["document_id"] for d in documents] + list(also or [])))
     paths = word_out.build_all(ids)
     for path in paths:
         print(f"   Word   {path.name}")
@@ -303,6 +332,15 @@ def print_summary(started: float) -> None:
     if counts.get("truncated_for_model"):
         print(f"   {counts['truncated_for_model']} clause(s) shortened for the model "
               f"(stored whole; see model_input_truncated)")
+    if counts.get("dropped") or counts.get("rescued"):
+        print(f"   {counts['dropped']} fragment(s) dropped as noise · {counts['rescued']} "
+              f"rescued by the judge (see dropped_fragments)")
+    if counts.get("unattached_tables"):
+        print(f"   {counts['unattached_tables']} table(s) kept whole with no clause "
+              f"pointing to them")
+    if counts.get("provisional"):
+        print(f"   {counts['provisional']} clause(s) PROVISIONAL — judged by the rules while "
+              f"the model was unavailable; re-judged on the next run with --judge llm")
 
     print(f"   {time.time() - started:.1f}s total")
     print(f"\n   Outputs in {config.OUTPUT_DIR}")
@@ -407,9 +445,11 @@ def main() -> int:
 
     documents = read_documents()                        # stage 2 -> the new documents
     extract_clauses(documents, judge=args.judge)        # stage 3 -> clauses, obligations
+    rejudged = rejudge_provisional_clauses(args.judge)  # stage 3b -> fallback verdicts, again
     propose_changes(engine=args.engine)                 # stage 4 -> proposals
     write_outputs(documents,                            # stage 5 -> Excel and Word
-                  regenerate_all=args.outputs == "all")
+                  regenerate_all=args.outputs == "all",
+                  also=rejudged)
 
     print_summary(started)
     return 0

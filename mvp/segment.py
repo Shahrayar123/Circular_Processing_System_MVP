@@ -134,12 +134,25 @@ def _split_list_items(piece: str) -> tuple[str, list[str]]:
     carried onto each item rather than surviving as a clause of its own. Returns
     ("", []) when the text is not a list.
     """
-    for pattern in (r"(?=(?<![A-Za-z0-9])[a-z][)]\s)",       # a) b) c)
-                    r"(?=(?<![A-Za-z0-9])[ivx]{1,5}[).]\s)",  # i) ii) iii)
-                    r"(?=(?<![A-Za-z0-9])\d{1,2}[)]\s)",      # 1) 2) 3)
+    # Each marker may open with a bracket — "(a)", "(ii)", "(3)" — and the split falls BEFORE
+    # the bracket. Splitting after it left "(" on the end of the stem, so every item of
+    # "... carried out as follows: (a) ... (b) ..." read "follows: ( a) In respect of".
+    for pattern in (r"(?=(?<![A-Za-z0-9(])\(?[a-z][)]\s)",       # a) b) c)   (a) (b) (c)
+                    r"(?=(?<![A-Za-z0-9(])\(?[ivx]{1,5}[).]\s)",  # i) ii) iii) (i) (ii)
+                    r"(?=(?<![A-Za-z0-9(])\(?\d{1,2}[)]\s)",      # 1) 2) 3)   (1) (2)
                     r"(?=[•▪]\s)"):
         parts = [p.strip() for p in re.split(pattern, piece) if p.strip()]
-        items = [p for p in parts
+
+        # A NUMBERED clause opening a LETTERED list — "1. Banks shall ensure the following:
+        # a) ... b) ..." — is the list's stem, not its first item. Read as an item, it was
+        # carried onto nothing, and the lettered items lost the sentence that makes them
+        # testable.
+        head = _LIST_ITEM.match(parts[0]) if parts else None
+        second = _LIST_ITEM.match(parts[1]) if len(parts) > 1 else None
+        numbered_stem = bool(head and second
+                             and (head.group("mark") or "").isdigit()
+                             and not (second.group("mark") or "").isdigit())
+        items = [p for p in (parts[1:] if numbered_stem else parts)
                  if _LIST_ITEM.match(p) and len(p) >= _MIN_LIST_ITEM_CHARS]
 
         # Two items make a list; one match is far more likely to be prose.
@@ -149,9 +162,17 @@ def _split_list_items(piece: str) -> tuple[str, list[str]]:
         if first and (first.group("mark") or "") not in _OPENERS:
             continue                                  # starts mid-sequence: a quotation
 
-        stem = parts[0] if parts and not _LIST_ITEM.match(parts[0]) else ""
+        stem = parts[0] if parts and (numbered_stem or not _LIST_ITEM.match(parts[0])) else ""
         return stem, items
     return "", []
+
+
+def _numeric_depth(ref) -> int | None:
+    """How deep a numeric clause reference is — "3" is 1, "3.2" is 2 — or None when the
+    reference is not a plain number ("a", "iv", "C-1", or no reference at all)."""
+    if ref and re.fullmatch(r"\d+(?:\.\d+)*", str(ref)):
+        return str(ref).count(".") + 1
+    return None
 
 
 def _attach_lead_ins(pieces: list[tuple]) -> list[tuple]:
@@ -159,18 +180,37 @@ def _attach_lead_ins(pieces: list[tuple]) -> list[tuple]:
 
     `pieces` is [(ref, text, start, end)] in document order; the same shape comes back.
     """
-    stems: list[tuple[int, int, str]] = []          # (source index, start, text)
+    stems: list[tuple] = []                         # (source index, start, text, ref)
     out: list[tuple] = []                           # (ref, text, start, end, source index)
     consumed: set[int] = set()
 
     for index, (ref, piece, start, end) in enumerate(pieces):
         inline_stem, items = _split_list_items(piece)
 
-        # The stem in reach, if there is one: the most recent, and only while it is
-        # close enough to still be the sentence that opened this list.
+        # A numbered clause at the stem's own level or above ENDS that stem's list.
+        # "2. ... the following arrangements shall apply:" owns "a." and "b."; it does not
+        # own "3.", which is its sibling. Without this the stem stayed in reach and was
+        # prepended to every numbered clause after it inside the lookback window: on a real
+        # SBP circular (PSP&OD Circular Letter 01 of 2026) paragraphs 3 and 4 both arrived
+        # carrying paragraph 2's opening sentence, and were retrieved and drafted as though
+        # they were about fuel-station card pricing.
+        depth = _numeric_depth(ref)
+        while stems and depth is not None:
+            stem_depth = _numeric_depth(stems[-1][3])
+            if stem_depth is None or stem_depth < depth:
+                break
+            stems.pop()
+
+        # The stem in reach: among the stems close enough to still be the sentence that
+        # opened this list, one stating a duty wins a TIE. In a marked-up draft a
+        # quotation's colon ("the policy states below:") sits closer to the list than the
+        # real stem, and this is what keeps the real one. Wording breaks the tie; it never
+        # decides whether there is a stem at all.
         pending = None
-        if stems and start - stems[-1][1] <= _LEAD_IN_LOOKBACK:
-            pending = stems[-1]
+        in_reach = [s for s in stems if start - s[1] <= _LEAD_IN_LOOKBACK]
+        if in_reach:
+            pending = next((s for s in reversed(in_reach) if _OBLIGATION.search(s[2])),
+                           in_reach[-1])
 
         if items:
             # A stem in the same block wins: it is unambiguously this list's sentence.
@@ -189,19 +229,25 @@ def _attach_lead_ins(pieces: list[tuple]) -> list[tuple]:
         # and "b)", so each arrives alone and the two-item rule above never fires. A
         # marker at the very START of a block is a safe enough signal on its own; the
         # same marker mid-sentence is not, which is why this is not the general rule.
-        if _LIST_ITEM.match(piece) and pending:
+        # A list starts at its opener — `a)`, `i)`, `1.` or a bullet — exactly as the inline
+        # rule requires. Once a stem is carrying a list, later items continue it. Without
+        # this, "The following should not be the part of deposits:" claimed the circular's
+        # own paragraph "4. Other instructions ..." as its first item.
+        marker = _LIST_ITEM.match(piece)
+        if marker and pending and (pending[0] in consumed or marker.group("mark") is None
+                                   or marker.group("mark") in _OPENERS):
             consumed.add(pending[0])
             out.append((ref, f"{pending[2]} {piece}", start, end, index))
             continue
 
-        # Only a stem that states a DUTY is worth carrying onto the items. A circular
-        # is full of colons that introduce quotations rather than obligations —
-        # "the policy states below:" — and in a marked-up draft those sit closer to the
-        # list than the real stem does. "shall cover at least the following aspects:"
-        # is the sentence that makes each item testable; the other is not.
-        if (_LEAD_IN.search(piece) and len(piece) <= _MAX_LEAD_IN_CHARS
-                and _OBLIGATION.search(piece)):
-            stems.append((index, start, piece))
+        # ANY sentence ending in a colon can open a list — wording does not decide it. "The
+        # following instructions are to be complied with:" has no "shall" and is exactly
+        # the sentence that makes its items testable; requiring a duty keyword sent those
+        # items to the judge stripped of it. A stem whose list has already been used is
+        # retired when a new stem appears, so it cannot outbid the new one.
+        if _LEAD_IN.search(piece) and len(piece) <= _MAX_LEAD_IN_CHARS:
+            stems = [s for s in stems if s[0] not in consumed]
+            stems.append((index, start, piece, ref))
         out.append((ref, piece, start, end, index))
 
     # A stem whose list was found is now carried by every item; on its own it says
@@ -210,10 +256,404 @@ def _attach_lead_ins(pieces: list[tuple]) -> list[tuple]:
             if index not in consumed]
 
 
-def split_clauses(text: str) -> list[dict]:
-    """Break the text into clause-sized pieces, keeping character offsets."""
-    clauses, collected, cursor = [], [], 0
+# ====== TABLES UNDER A CLAUSE ======
+#
+# A table in a circular is one of two different things:
+#
+#   a SUPPORTING table — the data a clause above it depends on: "Branches shall not retain
+#   cash above the limits given below", then a table of limits. Its rows are part of THAT
+#   clause. Split off, they say nothing testable on their own — "Urban | 5,000,000 |
+#   Regional Head" is 33 characters, fails the heading-length rule, and was DROPPED: the
+#   clause survived saying "the limits given below" with no limits anywhere in the system.
+#
+#   everything else — an annexure where each row is its own requirement, an "existing |
+#   revised" comparison, a signature block. Each row stays its own piece, as it always has.
+#
+# A table is attached only when all three gates hold. Each is there because a looser
+# version was run against ABL's own documents and failed:
+#
+#   1. A READER marked where it starts (`[table]`) — Word, HTML and PowerPoint, the
+#      formats that know where a table sits among paragraphs. In a spreadsheet every line
+#      is a row, and a multi-line cell beginning "1." looks exactly like a clause with rows
+#      after it — without this gate, unrelated rows of ABL's own working-file workbook
+#      glued onto fragments of cells. PDF, OCR and plain text have no table structure at
+#      all; they are handled separately, under UNMARKED TABLES.
+#   2. Every cell is short — data, not prose (DATA_TABLE_MAX_WORDS). ABL's call-back
+#      confirmation circular has a table whose cells run to 73 words; those rows are the
+#      procedure's steps, and attaching them would collapse the steps into one proposal.
+#   3. The paragraph DIRECTLY above the table points forward to it — "given below",
+#      "following", "as under", a closing colon. Without this, the signature table at the
+#      foot of ABL's circulars ("Irfan Saeed Dar | Safwan Khawaja") attached itself to the
+#      last clause, and the signatories' names became part of a retrieval query.
+#
+# An attached table runs until a row states a duty of its own, or anything that is not a
+# row arrives. A table failing any gate is split row by row exactly as before this rule
+# existed — so the worst case of the rule is the old behaviour, never a new failure.
+
+# Lines written by the Word, HTML and PowerPoint readers before and after every table
+# (extract.TABLE_MARKER, extract.TABLE_END_MARKER). Matched as patterns here for the same
+# reason `_SHEET_ROW` is: the splitter reads the readers' output format; it does not import
+# the readers.
+_TABLE_START = re.compile(r"^\[table\]$")
+_TABLE_END = re.compile(r"^\[/table\]$")
+
+# The clause reference of a table kept WHOLE as a clause of its own, because no paragraph
+# pointed to it — see TABLES UNDER A CLAUSE, and UNMARKED TABLES for the PDF form.
+TABLE_REF = "table"
+
+
+def _table_rows(lines: list[str], position: int) -> list[str]:
+    """The rows of the table whose start marker is at `lines[position]`, one string each.
+
+    A cell holding several paragraphs arrives as several lines. Those continuation lines
+    are folded back into the row they came from, so the data test measures each cell as it
+    really is — a cell carrying a run of numbered clauses must read as the long prose it
+    is, not as a short first line.
+    """
+    rows, closed = [], False
+    for following in lines[position + 1:]:
+        text = following.strip()
+        if _TABLE_END.match(text):
+            closed = True
+            break
+        row = _SHEET_ROW.match(text)
+        if row:
+            rows.append(row.group(2).strip())
+        elif rows:
+            rows[-1] = f"{rows[-1]} {text}"
+    # A table whose end is not in this block spans a blank line — an empty paragraph inside
+    # a cell — so its later rows are out of sight. Judged on its first rows alone, ABL's
+    # "existing | revised" table looked like data because its header row was short, and was
+    # kept whole. Unseen means NOT data: the table is split row by row, as before.
+    return rows if closed else []
+
+# Longest cell, in words, that still reads as data. The supporting tables this exists for
+# have cells of one to four words — a category, an amount, an authority. The prose tables
+# it must NOT capture start in the twenties. Eight leaves room for "Area Manager or Deputy
+# Area Manager" without admitting a sentence.
+DATA_TABLE_MAX_WORDS = 8
+
+# What the paragraph immediately above a table says when the table is part of it.
+_POINTS_FORWARD = re.compile(
+    r"\b(below|as under|as follows|following|hereunder|under-?mentioned|given in the table)\b"
+    r"|:\s*$",
+    re.IGNORECASE)
+
+
+def _is_data_table(rows: list[str]) -> bool:
+    """True when every cell of every row is short enough to be data rather than prose."""
+    return bool(rows) and all(len(cell.split()) <= DATA_TABLE_MAX_WORDS
+                              for row in rows for cell in row.split(" | "))
+
+
+def _can_own_table(entries: list[tuple[bool, str]], is_row: bool) -> bool:
+    """True when the piece being built is a clause the table after it can belong to.
+
+    Not a row piece: rows of an obligation table must not glue onto each other, or five
+    requirements collapse into one proposal. Not a piece containing a `### SHEET` /
+    `### SLIDE` marker: a table after one is on the next sheet or slide. And the LAST
+    paragraph of the piece — the one printed immediately above the table — must point
+    forward to it. The whole piece is deliberately not searched: an unnumbered circular
+    arrives as one long piece, and an "as under" three paragraphs earlier says nothing
+    about this table.
+    """
+    if not entries or is_row or any(text.startswith("###") for _, text in entries):
+        return False
+    last_paragraph = next((text for row, text in reversed(entries) if not row), "")
+    return bool(_POINTS_FORWARD.search(last_paragraph))
+
+
+# ====== UNMARKED TABLES ======
+#
+# PDF, OCR and plain text carry no table structure at all. A table comes out as one short
+# line per row with the columns gone — "Urban 5,000,000 Regional Head" — usually separated
+# from the clause above by a blank line. Each such block failed the heading-length rule and
+# was dropped: a real SBP circular (DMMD Circular No. 03) kept "the following institutions
+# have been selected ... as specified below:" and lost every institution it named.
+#
+# So data lines are attached to the clause before them when that clause's LAST sentence
+# points forward — whether they arrive as blocks of their own after a blank line (OCR,
+# plain text) or as the very next lines of the same block (native PDF) — and they keep
+# attaching until anything else arrives. Each keeps a line of its own, so the drafted test
+# carries them exactly as it carries a Word table's rows. Deliberately narrow, because
+# this runs on every PDF:
+#
+#   * last sentence, not the whole piece — a PDF paragraph is one long piece, and a
+#     "following" three sentences back says nothing about what comes next;
+#   * a data line is short, states no duty, and is not a numbered clause, a list item, a
+#     lead-in or a letter's sign-off — numbered and lettered lists keep their own handling
+#     (`_attach_lead_ins`), which carries the stem onto each item as its own clause.
+#
+# And ONLY for unstructured text (`split_clauses(unstructured=True)`). Word, HTML,
+# PowerPoint and spreadsheets mark their real tables, and a short line after a colon there
+# is a bullet the author typed. Run on ABL's own BRD, this recognition turned every bullet
+# list under "Maintain:" and "must ensure:" into table rows.
+
+
+# A clause number the way clauses are numbered — "2.", "2.1)", "(3)" — as opposed to a
+# serial-number column. "2 NATIONAL BANK OF PAKISTAN" is row 2 of a list whose columns
+# were lost; "2. Any excess shall be reported" is a clause. `_NUMBERED` accepts both,
+# because OCR often drops the dot after a clause number — right for splitting clauses,
+# wrong for recognising table rows: it ended the DMMD list after its first institution.
+_NUMBERED_CLAUSE = re.compile(r"^\s*\(?\d+(?:\.\d+)*[.)]\s")
+
+
+def _word_count(text: str) -> int:
+    """Words and numbers in a line, not counting marks standing alone ("-", "|", "—").
+    Counted with the dash, "Category B - metropolitan, no currency chest 25,000,000
+    30,000,000" was nine words, one over the limit, and broke a real table in two."""
+    return len(re.findall(r"[A-Za-z0-9][\w'’.,&/()-]*", text))
+
+
+def _is_data_line(line: str) -> bool:
+    """True for a line that reads as a table row with its columns gone."""
+    text = line.strip()
+    return bool(text) and (
+        _word_count(text) <= DATA_TABLE_MAX_WORDS
+        and not _OBLIGATION.search(text)
+        and not _NUMBERED_CLAUSE.match(text)
+        and not _LIST_ITEM.match(text)
+        and not _LEAD_IN.search(text)
+        and not _INFORMATIONAL.match(text)
+        and not _SHEET_ROW.match(text)
+        and not text.startswith(("###", "[table]", "[/table]")))
+
+
+def _is_data_block(block: str) -> bool:
+    """True when every line of a blank-line-separated block is a data line."""
+    lines = [line for line in block.split("\n") if line.strip()]
+    return bool(lines) and all(_is_data_line(line) for line in lines)
+
+
+def _points_to_data(piece: str) -> bool:
+    """True when a piece's own wording ends a sentence that refers to what follows it."""
+    wording = piece.split("\n")[0].strip()
+    if wording.startswith("###") or not re.search(r"[.:;]$", wording):
+        return False
+    last_sentence = re.split(r"(?<=[.;:])\s+(?=[A-Z0-9(])", wording)[-1]
+    return bool(_POINTS_FORWARD.search(last_sentence))
+
+
+def _join_piece(entries: list[tuple[bool, str]]) -> str:
+    """The text of one piece from its (is_row, text) entries.
+
+    Prose lines are joined with spaces, exactly as before. Rows of a table attached to a
+    clause each keep a line of their own — flattened into the sentence, "Urban |
+    5,000,000 | Regional Head Rural | 2,000,000 | Area Manager" no longer says which
+    limit belongs to which category, and neither a reviewer nor the model can recover it.
+
+    A piece that IS a single row keeps the old space-joined form, so an annexure row
+    clause is byte-for-byte what it was.
+    """
+    if not entries:
+        return ""
+    if entries[0][0]:
+        return " ".join(text for _, text in entries).strip()
+    lines, previous_row = [], False
+    for is_row, text in entries:
+        if is_row or previous_row or not lines:
+            lines.append(text)
+        else:
+            lines[-1] = f"{lines[-1]} {text}"
+        previous_row = is_row
+    return "\n".join(line.strip() for line in lines).strip()
+
+
+def split_table(clause_text: str) -> tuple[str, list[str]]:
+    """(the clause's own wording, the lines attached under it).
+
+    Every line AFTER the first is attached content. A clause only spans lines when
+    something was attached under it — a table's rows, a paragraph after that table, or the
+    data lines of an unmarked PDF or OCR table — because its own wording is always joined
+    onto one line. Looking for a cell separator instead missed the PDF case entirely, where
+    the columns never had one. The first line is always wording, even when it contains "|"
+    — an annexure row clause is one line with separators in it, and it is a sentence.
+
+    Used wherever the two need different treatment: obligations are split on the wording
+    and each carries the whole table, and a drafted test is written from the wording with
+    the table appended rather than chopped into the sentence.
+    """
+    lines = [line.strip() for line in (clause_text or "").split("\n")]
+    return lines[0], [line for line in lines[1:] if line]
+
+
+# ====== STRUCTURAL NOISE ======
+#
+# What a splitter may drop on its own authority: text that is recognisably NOT something a
+# regulator wrote as an instruction — page numbers, salutations and sign-offs, signature
+# markers, contents entries, and headings. Recognised by SHAPE, never by what the words say.
+#
+# This replaces a 60-character length rule, which dropped short sentences stating a duty,
+# and the keyword override that then kept only the short ones containing "shall" or
+# "must". "Agents are to be verified through NADRA." has neither, and a keyword gate removed
+# it before the judge — the only stage able to read it — ever saw it. Everything that is not
+# noise now reaches the judge, and everything that IS noise is logged and judged once more
+# (`segment_document`), so a wrong rule shows up as a rescue instead of as nothing at all.
+
+HEADING_MAX_WORDS = 12
+
+_SENTENCE_END = re.compile(r"""[.;:!?]["'”’)\]]*$""")
+_TITLE_SMALL_WORDS = {"a", "an", "and", "as", "at", "by", "for", "from", "in", "into",
+                      "of", "on", "or", "per", "the", "to", "under", "with", "vs"}
+_PAGE_FURNITURE = re.compile(r"^(page\s*)?\d{1,4}(\s*(of|/)\s*\d{1,4})?$|^[-–]\s*\d{1,4}\s*[-–]$",
+                             re.IGNORECASE)
+_SIGNATURE_MARK = re.compile(r"^(\(?-?\s*sd\s*-?\)?\s*)+$", re.IGNORECASE)
+_SALUTATION = re.compile(r"^(dear|respected)\b[^.!?]{0,60}$", re.IGNORECASE)
+_SIGN_OFF = re.compile(r"^(yours\b[\w\s,.]{0,25}|(best |kind |warm )?regards|sincerely|"
+                       r"thanking you)[,.!]?$", re.IGNORECASE)
+_CONTENTS_ENTRY = re.compile(r"^(?P<title>.*?\S)[\s.]+(?P<page>\d{1,3})$")
+# The header lines the email readers write in front of a message body.
+_EMAIL_HEADER = re.compile(r"^(subject|from|to|cc|bcc|date|sent)\s*:\s", re.IGNORECASE)
+
+
+def _looks_like_heading(text: str) -> bool:
+    """A short line with no sentence ending, set in capitals or in title case.
+
+    Shape only. "Dedicated audit staff members" is a bullet in lower case and is NOT a
+    heading; "REVISED CASH RETENTION LIMITS" and "Banking Policy & Regulations Department"
+    are. A line that ends a sentence is never a heading, however short — that is what keeps
+    "Banks shall reconcile ATM cassettes daily." and every lead-in ending in a colon.
+    """
+    if not text or _SENTENCE_END.search(text):
+        return False
+    if len(re.findall(r"[A-Za-z0-9][\w'’.,&/()-]*", text)) > HEADING_MAX_WORDS:
+        return False
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return True                                 # numbers and marks: page furniture
+    if sum(c.isupper() for c in letters) / len(letters) >= 0.6:
+        return True
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z'’]*", text)
+             if w.lower() not in _TITLE_SMALL_WORDS]
+    return bool(words) and all(w[0].isupper() for w in words)
+
+
+def _structural_noise(text: str) -> str | None:
+    """The rule that makes this fragment structural noise, or None if it is content."""
+    flat = " ".join((text or "").split())
+    if len(flat) < config.MIN_FRAGMENT_CHARS:
+        return "too short"
+    if _EMAIL_HEADER.match(flat) and len(flat.split()) <= 20:
+        return "email header"
+    if _PAGE_FURNITURE.match(flat):
+        return "page number"
+    if _SIGNATURE_MARK.match(flat):
+        return "signature"
+    if _SALUTATION.match(flat) and len(flat.split()) <= 6:
+        return "salutation"
+    if _SIGN_OFF.match(flat):
+        return "sign-off"
+    contents = _CONTENTS_ENTRY.match(flat)
+    if contents and _looks_like_heading(contents.group("title").rstrip(":").strip()):
+        return "contents entry"
+    if _looks_like_heading(flat):
+        return "heading"
+    return None
+
+
+def _block_noise(block: str) -> str | None:
+    """Why a whole blank-line block is noise, or None.
+
+    A block holding a table marker or a row is never noise — its rows are content, handled
+    line by line. A block is noise only when EVERY line is; and when each line is merely
+    too short on its own, the joined block is judged instead, because a sentence broken
+    across two narrow OCR lines is still a sentence.
+    """
+    lines = [line.strip() for line in block.split("\n") if line.strip()]
+    # A line carrying cell separators is a row, even when it arrives without its "[row N]"
+    # marker — a cell's second paragraph after an empty one, or a multi-line Excel cell. It
+    # is content here exactly as it is in `_piece_noise`; judged as a heading, ABL's
+    # "New Addition | 2.1. CALL DEPOSIT RECEIPT ..." and a branch row were dropped.
+    if not lines or any(_SHEET_ROW.match(line) or _TABLE_START.match(line)
+                        or _TABLE_END.match(line) or " | " in line for line in lines):
+        return None
+    rules = [_structural_noise(line) for line in lines]
+    if not all(rules):
+        return None
+    if all(rule == "too short" for rule in rules):
+        return _structural_noise(" ".join(lines))
+    return next(rule for rule in rules if rule != "too short")
+
+
+def _piece_noise(piece: str, ref) -> str | None:
+    """Why a finished piece is noise, or None. A piece carrying attached lines, and a table
+    kept whole, are content by construction — only the absolute floor applies to them."""
+    # A table row ("Kaghan Road, Balakot | KPK | PTCL | ...") is content by construction,
+    # like a table kept whole: in title case it passed for a heading, and a workbook of
+    # branch reference numbers lost a third of its rows.
+    if ref == TABLE_REF or "\n" in piece or " | " in piece:
+        return "too short" if len(piece) < config.MIN_FRAGMENT_CHARS else None
+    return _structural_noise(piece)
+
+
+def _emit_pending_data(pending: list, collected: list, dropped: list, as_table: bool) -> None:
+    """Close a run of unmarked data lines that no clause pointed to.
+
+    Kept together as ONE fragment — a table whose columns were lost — only when the run has
+    two lines or more AND began directly under a clause (`as_table`). That second condition
+    is what tells a table apart from the other runs of short lines a PDF is full of: the
+    letterhead at the top of page one, the signature block after "Yours truly,", OCR scraps
+    of a browser header. Grouped as tables, those became clauses of their own on almost
+    every real circular tested. Any other run is handled block by block like the rest of
+    the text: noise is dropped and logged, anything else is kept.
+    """
+    if not pending:
+        return
+    lines = [line for chunk, _, _ in pending for line in chunk]
+    if as_table and len(lines) >= 2:
+        collected.append((TABLE_REF, "\n".join(lines), pending[0][1], pending[-1][2]))
+    else:
+        for chunk, start, end in pending:
+            noise = _block_noise("\n".join(chunk))
+            if noise:
+                dropped.append({"text": "\n".join(chunk), "char_start": start,
+                                "char_end": end, "rule": noise})
+            else:
+                collected.append((None, " ".join(chunk), start, end))
+    pending.clear()
+
+
+def split_clauses(text: str, unstructured: bool = False) -> list[dict]:
+    """Break the text into clause-sized pieces, keeping character offsets.
+
+    `unstructured` is True for text with no structure of its own — PDF, OCR, plain text —
+    and switches on the recognition of tables whose columns were lost (UNMARKED TABLES).
+    Off by default: in structured text that recognition mistakes bullets for table rows.
+
+    Returns the clauses only. `split_with_drops` also returns what was discarded.
+    """
+    return split_with_drops(text, unstructured)[0]
+
+
+def split_with_drops(text: str, unstructured: bool = False) -> tuple[list[dict], list[dict]]:
+    """(clauses, dropped): the clauses, and every fragment a rule discarded.
+
+    Each dropped fragment is `{"text", "char_start", "char_end", "rule"}`. They are returned
+    rather than thrown away because a discarded fragment leaves no other trace — the caller
+    gives them one pass through the judge and logs the rest.
+    """
+    clauses, collected, cursor, dropped = [], [], 0, []
     blocks = re.split(r"\n\s*\n", text)
+
+    # Whether we are between a Word table's start and end markers. Kept ACROSS blocks: a
+    # cell holding an empty paragraph puts a blank line inside the table, which splits it
+    # into two blocks. Reset per block, the table's end was never recognised as closing
+    # anything, and the last clause of ABL's call-back confirmation table absorbed the
+    # paragraph printed after the table.
+    in_table = False
+
+    # Whether the block before this one attached data lines to the last clause, so the
+    # next data block continues the same table. See UNMARKED TABLES.
+    data_run_open = False
+
+    # Unmarked data blocks that no clause pointed to, held until their run ends so the
+    # run can be kept as one fragment. See `_emit_pending_data`.
+    pending_data: list = []
+    pending_after_clause = False
+
+    # What the previous block became — "clause" or "dropped" — so an unmarked run can tell
+    # whether it sits directly under a clause, and an OCR continuation can find its sentence.
+    last_block = None
 
     for block in blocks:
         raw_start = text.find(block, cursor)
@@ -227,11 +667,58 @@ def split_clauses(text: str) -> list[dict]:
         block_start = raw_start + (len(block) - len(block.lstrip()))
         block = block.strip()
 
-        # A short block is normally a heading — except when it ends in a colon, which
-        # makes it the stem of a list that may not start until the next page, or when it
-        # states a duty despite its length.
-        if (len(block) < config.MIN_CLAUSE_CHARS and not _LEAD_IN.search(block)
-                and not _states_a_duty(block)):
+        if not block:
+            continue
+
+        # A block starting in lower case, directly after a clause that has not finished its
+        # sentence, IS that sentence continuing — OCR leaves a blank line wherever the page
+        # had a gap. Kept apart, "maintained for the purpose and signed by the officer."
+        # became a clause of its own and the clause above lost its ending. Unstructured text
+        # only: in Word a paragraph break is the author's.
+        # Not while an unmarked table run is open: a row starting with an OCR scrap ("c-
+        # 15,000,000 ...") would otherwise be glued onto the clause above the table.
+        if (unstructured and not in_table and not pending_data and last_block == "clause"
+                and collected
+                and block[:1].islower() and "\n" not in collected[-1][1]
+                and not _SENTENCE_END.search(collected[-1][1])):
+            ref, piece, start, _ = collected[-1]
+            collected[-1] = (ref, piece + " " + " ".join(block.split()), start,
+                             block_start + len(block))
+            continue
+
+        # The rows of a table with no markers — PDF, OCR, plain text. Checked BEFORE the
+        # noise rule below, because a row with its columns gone looks just like a short
+        # heading. Not inside a marked table: those rows are handled as rows.
+        if unstructured and not in_table and _is_data_block(block):
+            data = [line.strip() for line in block.split("\n") if line.strip()]
+            end = block_start + len(block)
+            if (not pending_data and collected
+                    and (data_run_open or _points_to_data(collected[-1][1]))):
+                # Under a clause that points to it: part of that clause.
+                ref, piece, start, _ = collected[-1]
+                collected[-1] = (ref, piece + "\n" + "\n".join(data), start, end)
+                data_run_open = True
+                last_block = "clause"
+            else:
+                # Nothing points to it. Held until the run ends, and kept as a table only if
+                # the run began directly under a clause — see `_emit_pending_data`.
+                if not pending_data:
+                    pending_after_clause = last_block == "clause"
+                pending_data.append((data, block_start, end))
+                data_run_open = False
+            continue
+        data_run_open = False
+        _emit_pending_data(pending_data, collected, dropped, pending_after_clause)
+
+        # Structural noise — page numbers, salutations, signatures, contents entries,
+        # headings — is dropped here and logged. Never text dropped for what it SAYS; see
+        # STRUCTURAL NOISE. A block holding a table marker is never noise, so table state
+        # is always tracked by the line loop below.
+        noise = _block_noise(block)
+        if noise:
+            dropped.append({"text": block, "char_start": block_start,
+                            "char_end": block_start + len(block), "rule": noise})
+            last_block = "dropped"
             continue
 
         # Split a long block on numbered openers so each obligation stands alone.
@@ -245,6 +732,10 @@ def split_clauses(text: str) -> list[dict]:
         # source citation shown to a reviewer point at the wrong part of the document.
         # Walking the lines costs nothing and is exact.
         lines, current, current_ref = block.split("\n"), [], None
+        current_is_row = False            # is the open piece a table row standing alone?
+        table_owner = False               # are these rows part of the open clause?
+        table_whole = False               # is this data table kept whole as its own clause?
+        opened_in_table = False           # did the open piece START inside a table?
         pieces = []                       # (ref, text, start, end)
         piece_start = piece_end = block_start
         line_at = block_start             # absolute offset of the current line
@@ -252,26 +743,111 @@ def split_clauses(text: str) -> list[dict]:
         def flush():
             """Close the piece being built, if it has anything in it."""
             if current:
-                pieces.append((current_ref, " ".join(current).strip(),
-                               piece_start, piece_end))
+                pieces.append((current_ref, _join_piece(current), piece_start, piece_end))
 
-        for line in lines:
+        for position, line in enumerate(lines):
             lead = len(line) - len(line.lstrip())          # indent, kept out of offsets
             content_at = line_at + lead
             content_end = line_at + len(line.rstrip())
             stripped = line.strip()
 
+            # A table is starting. Decide ONCE, for the whole table, whether it belongs to
+            # the clause above — see TABLES UNDER A CLAUSE. The markers are not text: they
+            # add nothing to any piece, and only their own line moves the offset.
+            if _TABLE_START.match(stripped):
+                is_data = _is_data_table(_table_rows(lines, position))
+                table_owner = is_data and _can_own_table(current, current_is_row)
+                # A data table nothing points to is kept WHOLE, as a clause of its own.
+                # Split row by row, every row is short enough for the noise rule to take,
+                # and the limits would vanish because no paragraph said "below".
+                table_whole = is_data and not table_owner
+                if table_whole:
+                    flush()
+                    current, current_ref, current_is_row = [], TABLE_REF, False
+                in_table = True
+                line_at += len(line) + 1
+                continue
+
+            # The table has ended. Anything that STARTED inside it — a row standing alone,
+            # or a numbered clause from a paragraph inside a cell — is closed here, so the
+            # paragraph after the table starts a piece of its own. Without this, tables now
+            # being read where they sit, the section after a signature block arrived as
+            # "Chief BSG | Chief CG INDIVIDUAL CP CREATION ...", and the last clause inside
+            # a manual-amendment table absorbed the next chapter's heading. A clause that
+            # began BEFORE the table and owns it stays open: an unnumbered paragraph after
+            # it continues the clause, as unnumbered paragraphs always have.
+            if _TABLE_END.match(stripped):
+                table_owner = table_whole = in_table = False
+                if current and opened_in_table:
+                    flush()
+                    current, current_ref, current_is_row = [], None, False
+                line_at += len(line) + 1
+                continue
+
             sheet_row = _SHEET_ROW.match(stripped)
             if sheet_row:
+                body = sheet_row.group(2).strip()
+                # The piece stays open, so the clause's span grows to cover its table and
+                # the next numbered clause is still what closes it. A row that states a
+                # duty of its own ends the attachment: from there the table is a list of
+                # requirements, and each row stands alone.
+                if table_whole:
+                    if not current:
+                        piece_start = content_at + sheet_row.start(2)
+                        opened_in_table = True
+                    # The first row is the fragment's own line; the rest are attached
+                    # under it, each on a line of its own.
+                    current.append((bool(current), body))
+                    piece_end = content_end
+                    line_at += len(line) + 1
+                    continue
+                if table_owner and not _states_a_duty(body):
+                    current.append((True, body))
+                    piece_end = content_end
+                    line_at += len(line) + 1
+                    continue
+                table_owner = False
                 flush()
                 current_ref = _row_ref(sheet_row.group(1), sheet_row.group(2))
-                current = [sheet_row.group(2).strip()]
+                current, current_is_row = [(True, body)], True
+                opened_in_table = in_table
                 # Point past the "[row 4] " marker at the row's actual content.
                 piece_start = content_at + sheet_row.start(2)
                 piece_end = content_end
                 line_at += len(line) + 1
                 continue
 
+            # A second paragraph inside a cell of a table kept whole belongs to that row.
+            if table_whole and current:
+                current[-1] = (current[-1][0], f"{current[-1][1]} {stripped}")
+                piece_end = content_end
+                line_at += len(line) + 1
+                continue
+
+            # A second paragraph inside a cell of an attached table belongs to that row,
+            # not to the clause and not to a piece of its own.
+            if table_owner and current and current[-1][0]:
+                current[-1] = (True, f"{current[-1][1]} {stripped}")
+                piece_end = content_end
+                line_at += len(line) + 1
+                continue
+
+            # A row of an UNMARKED table in the same block as the clause pointing to it.
+            # Native PDF text puts no blank line between a clause and the table under it, so
+            # the rows arrive as ordinary lines and were joined onto the clause with spaces:
+            # the limits survived inside the clause's sentence, but not as lines of their
+            # own, so the drafted test — which carries a clause's attached lines — never saw
+            # them. A wrapped line of the clause itself is not taken: until the wording ends
+            # a sentence that points forward, the next line is still that sentence.
+            if (unstructured and not in_table and current and not current_is_row
+                    and _is_data_line(stripped)
+                    and (current[-1][0] or _points_to_data(_join_piece(current)))):
+                current.append((True, stripped))
+                piece_end = content_end
+                line_at += len(line) + 1
+                continue
+
+            table_owner = False
             match = _NUMBERED.match(line)
             if match and current:
                 flush()
@@ -284,18 +860,28 @@ def split_clauses(text: str) -> list[dict]:
             elif not current:
                 piece_start = content_at
 
-            current.append(stripped)
+            if not current:
+                current_is_row = False
+                opened_in_table = in_table
+            current.append((False, stripped))
             piece_end = content_end
             line_at += len(line) + 1       # +1 for the newline split() removed
 
         flush()
         collected.extend(pieces)
+        if pieces:
+            last_block = "clause"
 
     # Lists are joined to the sentence that introduces them before anything is measured
     # — an item is often short on its own and only reaches a sensible length once it
     # carries its stem.
+    _emit_pending_data(pending_data, collected, dropped, pending_after_clause)
+
     for ref, piece, start, end in _attach_lead_ins(collected):
-        if len(piece) < config.MIN_CLAUSE_CHARS and not _states_a_duty(piece):
+        noise = _piece_noise(piece, ref)
+        if noise:
+            dropped.append({"text": piece, "char_start": start,
+                            "char_end": max(end, start + 1), "rule": noise})
             continue
         clauses.append({
             "clause_ref": ref,
@@ -305,9 +891,10 @@ def split_clauses(text: str) -> list[dict]:
             # lines joined with spaces, so its length only approximates the span it came
             # from — and an approximate end makes every coverage figure approximate too.
             "char_end": max(end, start + 1),
+            "table_unattached": ref == TABLE_REF,
         })
 
-    return clauses
+    return clauses, dropped
 
 
 def classify(clause_text: str) -> tuple[bool, str, str]:
@@ -554,14 +1141,19 @@ def split_obligations(clause_text: str) -> list[str]:
     query and the wording of a proposed test.
     """
     text = clause_text.strip()
-    parts = [p.strip(" ,;") for p in _OBLIGATION_JOIN.split(text) if p.strip(" ,;")]
+    # Split the WORDING, and give every duty the whole table. A table under a clause
+    # parameterises the clause, not one sentence of it — split naively, the rows ride
+    # along on the last duty only, and the first duty's proposed test loses its limits.
+    wording, rows = split_table(text)
+    table = "\n".join(rows)
+    parts = [p.strip(" ,;") for p in _OBLIGATION_JOIN.split(wording) if p.strip(" ,;")]
     if len(parts) < 2:
         return [text]
 
     # Carry the subject onto the later duties. "Banks shall verify X, and shall maintain
     # Y" gives "shall maintain Y" — true to the source but useless as a query, because
     # the subject is what the retrieval needs to match a branchless-banking test.
-    subject = text.split(" shall")[0].split(" must")[0].strip()
+    subject = wording.split(" shall")[0].split(" must")[0].strip()
     # Drop a leading list marker — "e) The Bank" carries "e)" onto every later duty, and
     # the marker belongs to the clause reference, not to the sentence.
     subject = _LIST_ITEM.sub("", subject).strip()
@@ -574,7 +1166,8 @@ def split_obligations(clause_text: str) -> list[str]:
     out = [p for p in out if len(p) >= MIN_OBLIGATION_CHARS]
     if len(out) < 2:
         return [text]
-    return out[:MAX_OBLIGATIONS_PER_CLAUSE]
+    return [f"{duty}\n{table}" if table else duty
+            for duty in out[:MAX_OBLIGATIONS_PER_CLAUSE]]
 
 
 # ====== SANITY CHECKS OVER THE SPLIT ======
@@ -627,7 +1220,8 @@ def check_split(clauses: list[dict], text: str) -> str:
     return "; ".join(problems)
 
 
-def _split_with_fallback(text: str) -> tuple[list[dict], str]:
+def _split_with_fallback(text: str,
+                         unstructured: bool = False) -> tuple[list[dict], str, list[dict]]:
     """Split the text into clauses, and say WHICH rung of the ladder produced them.
 
     Rung 1 is structure — numbering, headings, table rows, spreadsheet rows — and is what
@@ -639,9 +1233,10 @@ def _split_with_fallback(text: str) -> tuple[list[dict], str]:
     The rung is returned, not hidden, because a fallback split must never be
     indistinguishable from a structural one.
     """
-    found = split_clauses(text)[: config.MAX_CLAUSES_PER_DOC]
+    found, dropped = split_with_drops(text, unstructured)
+    found = found[: config.MAX_CLAUSES_PER_DOC]
     if found or not text.strip():
-        return found, "structure"
+        return found, "structure", dropped
 
     # Rung 2 — obligation-bearing lines, for a short instruction or OCR output with no
     # recoverable numbering.
@@ -653,7 +1248,8 @@ def _split_with_fallback(text: str) -> tuple[list[dict], str]:
         found.append({"clause_ref": None, "text": line,
                       "char_start": max(start, 0),
                       "char_end": max(start, 0) + len(line)})
-    return found, "obligation-lines"
+    # Rung 2 keeps every line, so nothing it saw was dropped — no keyword decides which.
+    return found, "obligation-lines", []
 
 
 def _judge_clauses(found: list[dict], judge: str) -> list[tuple]:
@@ -670,24 +1266,30 @@ def _judge_clauses(found: list[dict], judge: str) -> list[tuple]:
 
 def _store_clause(conn, document_id: int, sequence: int, clause: dict, verdict: tuple,
                   rung: str, chars_per_page: int) -> int:
-    """Write one clause row and return its id."""
+    """Write one clause row and return its id.
+
+    A verdict from the rules standing in for an unreachable model is stored with
+    `is_actionable` NULL — PROVISIONAL, not a decision — and `rejudge_provisional` asks the
+    model again on the next run. Stored as 1 or 0, a keyword verdict made on the day the
+    model was down would quietly become the permanent answer.
+    """
     actionable, strata, reason, judged_by = verdict
     return store.insert(conn, "clauses", {
         "document_id": document_id,
         "clause_ref": clause["clause_ref"] or f"para {sequence}",
         "sequence": sequence,
-        # Stored WHOLE. Only what is sent to a model is capped, and that is recorded on
-        # the row rather than done quietly.
         "text": clause["text"],
         "page_number": clause["char_start"] // chars_per_page + 1,
         "char_start": clause["char_start"],
         "char_end": clause["char_end"],
-        "is_actionable": 1 if actionable else 0,
+        "is_actionable": None if is_provisional(judged_by) else (1 if actionable else 0),
         "strata_tag": strata,
         "reason": reason,
         "judged_by": judged_by,
         "segmented_by": rung,
         "model_input_truncated": 1 if len(clause["text"]) > JUDGE_INPUT_CHARS else 0,
+        "rescued_by": clause.get("rescued_by"),
+        "table_unattached": 1 if clause.get("table_unattached") else 0,
     })
 
 
@@ -710,14 +1312,115 @@ def _store_obligations(conn, clause_id: int, clause_text: str, strata: str) -> l
     return duties
 
 
-def segment_document(conn, document_id: int, text: str, judge: str = "rules") -> dict:
+# ====== DROPPED TEXT GETS A SECOND READ ======
+
+def _rescue_dropped(dropped: list[dict], judge: str) -> tuple[list[tuple], list[dict]]:
+    """Judge every discarded fragment once more. Returns (rescued, still dropped).
+
+    A splitting rule that removes text the judge would have called an obligation fails in
+    silence: no clause, no proposal, no warning. So everything a STRUCTURAL rule dropped is
+    judged once — with the same judge as the rest of the document — and anything found to
+    be an obligation comes back as a clause marked `rescued_by`. Fragments under the absolute
+    floor are not re-read: they are too short to be read as anything.
+
+    With the rules judge a keyword brings a fragment BACK. That is a keyword adding to what
+    is read — the one direction a keyword check is allowed to act in.
+    """
+    candidates = [d for d in dropped if d["rule"] != "too short"]
+    kept = [d for d in dropped if d["rule"] == "too short"]
+    if not candidates:
+        return [], dropped
+    # A dropped block can span lines; as a clause it is one sentence, not a table.
+    clauses = [{"clause_ref": None, "text": " ".join(d["text"].split()),
+                "char_start": d["char_start"], "char_end": d["char_end"]}
+               for d in candidates]
+    rescued = []
+    for fragment, clause, verdict in zip(candidates, clauses, _judge_clauses(clauses, judge)):
+        if verdict[0]:
+            clause["rescued_by"] = f"{verdict[3]} (dropped as {fragment['rule']})"
+            rescued.append((clause, verdict))
+        else:
+            kept.append(fragment)
+    return rescued, sorted(kept, key=lambda d: d["char_start"])
+
+
+def _merge_in_order(found: list[dict], verdicts: list[tuple],
+                    rescued: list[tuple]) -> tuple[list[dict], list[tuple]]:
+    """Put rescued fragments back where they sit, so sequence and page order stay true."""
+    if not rescued:
+        return found, verdicts
+    pairs = sorted(list(zip(found, verdicts)) + rescued, key=lambda p: p[0]["char_start"])
+    return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+# ====== PROVISIONAL VERDICTS ======
+#
+# When the model cannot be reached, `classify_llm` answers with the keyword rules and says
+# so in `judged_by`. That answer is PROVISIONAL: stored with `is_actionable` NULL, still
+# turned into flagged proposals (a clause waiting silently for the next run is invisible),
+# and asked of the model again on every later run until the model answers.
+
+# The `judged_by` labels a fallback writes, and the one a clause gets when a reviewer acted
+# before the model could be asked. All start with "rules (".
+_REJUDGE_LABELS = ("rules (model unavailable)", "rules (unusable answer)")
+_KEPT_LABEL = "rules (kept: a reviewer acted before the model could judge)"
+
+
+def is_provisional(judged_by: str | None) -> bool:
+    """True for a verdict the rules gave in the model's place."""
+    return bool(judged_by) and judged_by.startswith("rules (")
+
+
+def rejudge_provisional(conn) -> dict:
+    """Ask the model again about every clause a fallback judged. Returns what happened.
+
+    For each queued clause the model's verdict replaces the provisional one, and the
+    clause's obligations and proposals are cleared so stage 4 proposes afresh — unless a
+    human has already acted on a proposal from that clause. That clause is left exactly as
+    it is, relabelled so it is not queued for ever, and counted.
+
+    Returns {"queued", "confirmed", "still_provisional", "kept_human": counts,
+    "documents": ids of documents whose clauses changed}.
+    """
+    rows = conn.execute(
+        "SELECT id, document_id, text FROM clauses WHERE is_actionable IS NULL "
+        "AND judged_by IN (?, ?) ORDER BY document_id, sequence", _REJUDGE_LABELS).fetchall()
+    summary = {"queued": len(rows), "confirmed": 0, "still_provisional": 0,
+               "kept_human": 0, "documents": []}
+    if not rows:
+        return summary
+
+    for row, verdict in zip(rows, classify_llm([r["text"] for r in rows])):
+        actionable, strata, reason, judged_by = verdict
+        if is_provisional(judged_by):
+            summary["still_provisional"] += 1
+            continue
+        if not store.clear_clause_work(conn, row["id"]):
+            conn.execute("UPDATE clauses SET judged_by = ? WHERE id = ?",
+                         (_KEPT_LABEL, row["id"]))
+            summary["kept_human"] += 1
+            continue
+        conn.execute("UPDATE clauses SET is_actionable = ?, strata_tag = ?, reason = ?, "
+                     "judged_by = ? WHERE id = ?",
+                     (1 if actionable else 0, strata, reason, judged_by, row["id"]))
+        if actionable:
+            _store_obligations(conn, row["id"], row["text"], strata)
+        summary["confirmed"] += 1
+        if row["document_id"] not in summary["documents"]:
+            summary["documents"].append(row["document_id"])
+    return summary
+
+
+def segment_document(conn, document_id: int, text: str, judge: str = "rules",
+                     unstructured: bool = False) -> dict:
     """Split one document into clauses, judge each, and store them.
 
-    Four steps, in order:
-        1. split          -> clauses, and which rung of the ladder produced them
+    Five steps, in order:
+        1. split          -> clauses, which rung produced them, and what was dropped
         2. judge          -> is this clause an obligation the bank can be audited against
-        3. sanity-check   -> flag a split that looks wrong; never fail the document for it
-        4. store          -> one clause row each, plus its obligations if it is actionable
+        3. rescue         -> judge the dropped text once more; restore any obligation found
+        4. sanity-check   -> flag a split that looks wrong; never fail the document for it
+        5. store          -> one clause row each, its obligations, and the drops logged
 
     Returns what the caller needs to report the document —
     `{"clauses": n, "actionable": n, "warning": str or None}` — rather than just a count.
@@ -740,8 +1443,10 @@ def segment_document(conn, document_id: int, text: str, judge: str = "rules") ->
             f"acted on its proposals — refusing to segment it again. Investigate before "
             f"re-running; a duplicate set would put every clause in the queue twice.")
 
-    found, rung = _split_with_fallback(text)
+    found, rung, dropped = _split_with_fallback(text, unstructured)
     verdicts = _judge_clauses(found, judge)
+    rescued, dropped = _rescue_dropped(dropped, judge)
+    found, verdicts = _merge_in_order(found, verdicts, rescued)
 
     # A split that looks wrong FLAGS the document; it never fails it. Someone has to
     # notice, and a low clause count three screens later is not noticing.
@@ -751,27 +1456,28 @@ def segment_document(conn, document_id: int, text: str, judge: str = "rules") ->
                      (warning, document_id))
 
     _debug_split(document_id, text, found, verdicts, rung, warning)
+    _debug_drops(dropped, rescued)
 
-    # Page numbers are estimated from character position: the readers give us text, not
-    # a page-to-character map. Good enough to send a reviewer to the right page.
     chars_per_page = max(len(text) // max(_pages(conn, document_id), 1), 1)
+    for fragment in dropped:
+        store.insert(conn, "dropped_fragments", {"document_id": document_id, **fragment})
 
     for sequence, (clause, verdict) in enumerate(zip(found, verdicts), start=1):
         clause_id = _store_clause(conn, document_id, sequence, clause, verdict,
                                   rung, chars_per_page)
-        actionable, strata = verdict[0], verdict[1]
-        # Only an actionable clause has duties worth pulling apart. A heading with a
-        # comma in it is not three obligations.
-        if actionable:
-            duties = _store_obligations(conn, clause_id, clause["text"], strata)
+        # Obligations are stored whenever the verdict found a duty — a PROVISIONAL verdict
+        # included, so the clause still reaches a reviewer, flagged, instead of waiting
+        # unseen for the model to come back.
+        if verdict[0]:
+            duties = _store_obligations(conn, clause_id, clause["text"], verdict[1])
             _debug_obligations(clause["clause_ref"] or f"para {sequence}",
                                clause["text"], duties)
     return {"clauses": len(found),
             "actionable": sum(1 for v in verdicts if v[0]),
+            "rescued": len(rescued),
+            "dropped": len(dropped),
             "warning": warning}
 
-
-# ===== DEBUG PRINTS — delete both functions and their two call sites when done =====
 
 def _debug_split(document_id, text, found, verdicts, rung, warning) -> None:
     """Print what the splitter produced for one document, and what it left behind."""
@@ -812,6 +1518,18 @@ def _debug_split(document_id, text, found, verdicts, rung, warning) -> None:
         print(f"[SEGMENT]   {i:>3}. [{(c['clause_ref'] or '--'):>9}] "
               f"{'ACTIONABLE' if v[0] else 'info      '} {len(c['text']):>5}ch "
               f"{(v[1] or '-'):<20} " + c["text"][:70].replace("\n", " "))
+
+
+def _debug_drops(dropped: list[dict], rescued: list[tuple]) -> None:
+    """Print what the splitter discarded, by rule, and what the judge brought back."""
+    for clause, _ in rescued:
+        print(f"[SEGMENT]   RESCUED ({clause['rescued_by']}): " + clause["text"][:90])
+    by_rule: dict[str, int] = {}
+    for fragment in dropped:
+        by_rule[fragment["rule"]] = by_rule.get(fragment["rule"], 0) + 1
+    if by_rule:
+        print("[SEGMENT]   dropped as noise: "
+              + ", ".join(f"{n} {rule}" for rule, n in sorted(by_rule.items())))
 
 
 def _debug_obligations(ref, clause_text, duties) -> None:
