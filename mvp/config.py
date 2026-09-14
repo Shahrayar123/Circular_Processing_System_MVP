@@ -31,18 +31,15 @@ DB_PATH = ROOT / "mvp_demo.db"
 # The real system indexes ~7,500 tests. 500 keeps the demo instant.
 LIBRARY_SIZE = 500
 TOP_K = 8                      # candidates shown to the decision step
-MIN_CLAUSE_CHARS = 60          # shorter fragments are headings, not obligations.
-                               # Kept low because real circulars are often short —
-                               # a one-page RIA instruction must not yield 0 clauses.
-                               # A short fragment that STATES A DUTY is kept anyway —
-                               # see MIN_OBLIGATION_CLAUSE_CHARS below.
-
-# The floor for a fragment that is short but carries obligation wording. Length is only
-# a proxy for "this is a heading"; obligation wording is direct evidence that it is not.
-# "Banks shall reconcile ATM cassettes daily." is 42 characters and is a real audit test;
-# dropping it on length loses a control with no error anywhere. This floor exists so that
-# a stray "shall" in a five-word fragment still cannot become a clause.
-MIN_OBLIGATION_CLAUSE_CHARS = 25
+# The absolute floor for a fragment to become a clause — and deliberately the ONLY length
+# rule. A higher threshold (it was 60) is a proxy for "this is a heading", and it discarded
+# short sentences that state a duty: "Banks shall reconcile ATM cassettes daily." is 42
+# characters. Headings, signatures and page furniture are now recognised by their SHAPE
+# (segment.py, STRUCTURAL NOISE) and everything else reaches the judge. Below this floor a
+# fragment is too short to be read as anything, so a stray "shall" in a five-word scrap
+# still cannot become a clause.
+MIN_FRAGMENT_CHARS = 25
+MIN_OBLIGATION_CLAUSE_CHARS = MIN_FRAGMENT_CHARS
 MAX_CLAUSES_PER_DOC = 250      # a cap against a runaway document, not a sample size.
                                # It was 40, which silently TRUNCATED a 48-page manual —
                                # once lettered lists are split into their items, a real

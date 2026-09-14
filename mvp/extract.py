@@ -35,6 +35,28 @@ SUPPORTED = {
 IMAGES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif"}
 LEGACY = {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}
 
+# Kinds whose text has NO paragraph or table structure of its own: lines are wherever the
+# page layout, the OCR engine or the plain-text author broke them. Only for these does the
+# splitter guess at tables whose columns were lost (segment.py, UNMARKED TABLES).
+#
+# Everything else is structured — Word, HTML, PowerPoint and spreadsheets mark real tables,
+# and a short line after a colon there is a genuine bullet. Guessed at, ABL's own BRD had
+# every bullet list under "Maintain:" and "must ensure:" turned into table rows, and each
+# would have been pasted under its proposed test as if it were a table. An unknown kind
+# counts as structured, so a new reader gets no guessing until someone decides it should.
+UNSTRUCTURED_KINDS = {
+    "native-pdf", "scanned-pdf", "mixed-pdf", "image", "txt", "csv",
+    "rtf-stripped",          # RTF read without LibreOffice: control words stripped, no tables
+    "eml", "msg",            # the PLAIN body; an HTML body reports eml-html / msg-html
+    "email-body",            # an RIA message body recorded as its own document
+}
+
+
+def is_unstructured(kind: str) -> bool:
+    """True when text of this kind carries no structure, so table rows may have lost their
+    columns and must be recognised from the shape of the lines."""
+    return kind in UNSTRUCTURED_KINDS
+
 MAX_DEPTH = 3                      # a document inside a document inside a document
 MAX_TOTAL_CHARS = 4_000_000        # a 500 MB workbook fails the document, not the batch
 NATIVE_TEXT_MIN_CHARS = 120        # per page, below this the page is treated as scanned
@@ -201,27 +223,108 @@ def table_row(number: int, cells: list[str]) -> str:
     return f"[row {number}] " + " | ".join(cells)
 
 
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+# Written on lines of their own around the rows of every table whose place among the
+# paragraphs is known: Word, HTML (email bodies included) and PowerPoint. They are
+# structure, not text: `segment.split_clauses` consumes them to know where a table starts
+# and ends, so it can decide whether the table belongs to the paragraph printed directly
+# above it, and so a paragraph after the table does not get glued onto its last row. A
+# spreadsheet never emits them — every line of a sheet is already a row, and ABL's
+# workbooks hold one requirement per row (see segment.py, TABLES UNDER A CLAUSE).
+TABLE_MARKER = "[table]"
+TABLE_END_MARKER = "[/table]"
+
+
+def _is_table_of_contents(sdt) -> bool:
+    """True for the content control Word wraps around a generated table of contents."""
+    gallery = sdt.find(f"{_W}sdtPr/{_W}docPartObj/{_W}docPartGallery")
+    return gallery is not None and "contents" in (gallery.get(_W + "val") or "").lower()
+
+
+def _docx_blocks(parent, document):
+    """Every paragraph and table in the body, IN THE ORDER THEY APPEAR ON THE PAGE.
+
+    Order is the whole point. The obvious reader — `document.paragraphs`, then
+    `document.tables` — returns two separate lists and so moves every table to the end of
+    the document. A table of limits printed directly under "Branches shall not retain cash
+    above the limits given below" arrived after the NEXT clause instead, where nothing
+    could tell which clause it belonged to. Walking the body's XML children is the only
+    way to keep the two interleaved.
+
+    Content controls (`w:sdt`) are descended into, because python-docx's own paragraph and
+    table lists skip whatever is inside one. A TABLE OF CONTENTS is also a content control,
+    and that one is skipped on purpose: read, its entries become clauses ("6.2 Excel File:
+    10") and the last entry glues itself onto the first real paragraph — on ABL's own BRD,
+    "8. Annexures: 11" arrived on the front of the Overview.
+    """
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    for child in parent.iterchildren():
+        if child.tag == _W + "p":
+            yield Paragraph(child, document)
+        elif child.tag == _W + "tbl":
+            yield Table(child, document)
+        elif child.tag == _W + "sdt" and not _is_table_of_contents(child):
+            content = child.find(_W + "sdtContent")
+            if content is not None:
+                yield from _docx_blocks(content, document)
+
+
+def _docx_row_cells(row) -> list[str]:
+    """The text of each DISTINCT cell in one table row, left to right.
+
+    A horizontally merged cell is returned by python-docx once per grid column it spans, so
+    a heading merged across three columns reads "Limits | Limits | Limits". De-duplicated on
+    the underlying `<w:tc>` element, not on the text — two genuinely separate cells can hold
+    the same value, and both must survive.
+
+    Paragraphs INSIDE a cell stay on separate lines — do not collapse them. ABL's manual-
+    amendment circulars put a whole run of numbered clauses ("2.1.10.3.1.1.", ".2", ".3")
+    in one cell of an "existing | revised" table, and each is a separate obligation the
+    splitter finds by its number at the start of a line. Collapsing the cell into one line
+    merged ten such clauses into two.
+    """
+    cells, seen = [], []
+    for cell in row.cells:
+        if any(cell._tc is element for element in seen):
+            continue
+        seen.append(cell._tc)
+        text = cell.text.strip()
+        if text:
+            cells.append(text)
+    return cells
+
+
 def read_docx(path: Path) -> Extracted:
-    """Read a Word file: paragraphs AND table rows.
+    """Read a Word file: paragraphs AND table rows, in document order.
 
     Tables matter — obligations in SBP circulars are routinely inside them, and a reader
-    that walks only paragraphs loses those clauses without any error.
+    that walks only paragraphs loses those clauses without any error. Where a table sits
+    matters just as much: `segment.split_clauses` can attach a table to the clause printed
+    above it, which only works if the table is still above the next clause when it gets
+    there. See `_docx_blocks`.
     """
     from docx import Document
+    from docx.table import Table
 
     document = Document(str(path))
-    parts = [p.text for p in document.paragraphs if p.text.strip()]
-
-    # Tables carry obligations routinely — a row is often one requirement. Keep the row
-    # structure with a separator rather than flattening it into prose, and tag each row
-    # with the SAME `[row N]` marker the spreadsheet reader uses (see `table_row`).
-    row_number = 0
-    for table in document.tables:
-        for row in table.rows:
-            cells = [c.text.strip() for c in row.cells if c.text.strip()]
-            if cells:
+    parts, row_number = [], 0
+    for block in _docx_blocks(document.element.body, document):
+        if isinstance(block, Table):
+            rows = [cells for cells in (_docx_row_cells(row) for row in block.rows) if cells]
+            if not rows:
+                continue
+            parts.append(TABLE_MARKER)
+            # Each row tagged with the SAME `[row N]` marker the spreadsheet reader uses
+            # (see `table_row`), so the splitter can tell a row from a line of prose.
+            for cells in rows:
                 row_number += 1
                 parts.append(table_row(row_number, cells))
+            parts.append(TABLE_END_MARKER)
+        elif block.text.strip():
+            parts.append(block.text)
 
     result = Extracted(text=_clean("\n".join(parts)), pages=1, kind="docx")
     result.children = _embedded_in_ooxml(path)
@@ -251,6 +354,19 @@ def read_excel(path: Path) -> Extracted:
                      kind="excel")
 
 
+# ====== POWERPOINT ======
+
+def _pptx_reading_order(shapes) -> list:
+    """Shapes top-to-bottom, then left-to-right — the order a person reads the slide.
+
+    python-pptx yields shapes in z-order, which is the order they were ADDED, not where
+    they sit. A table added before the text boxes above it came out first, and its last
+    row was glued onto the slide title. A shape with no explicit position sorts first.
+    """
+    return sorted(shapes, key=lambda s: (s.top if s.top is not None else 0,
+                                         s.left if s.left is not None else 0))
+
+
 def _pptx_shape_text(shape, out: list, counter: list) -> None:
     """Append every piece of text a slide shape carries. Recurses into groups.
 
@@ -267,17 +383,22 @@ def _pptx_shape_text(shape, out: list, counter: list) -> None:
     the file at all: the deck reports as ingested and the obligations are simply absent.
     """
     if shape.shape_type == 6:                       # MSO_SHAPE_TYPE.GROUP
-        for child in shape.shapes:
+        for child in _pptx_reading_order(shape.shapes):
             _pptx_shape_text(child, out, counter)
         return
     if getattr(shape, "has_table", False):
-        for row in shape.table.rows:
-            cells = [c.text.strip() for c in row.cells if c.text.strip()]
-            if cells:
-                # Through the shared helper, so a slide table row reaches the splitter as
-                # a row and not as text glued to the previous clause.
+        rows = [cells for cells in ([c.text.strip() for c in row.cells if c.text.strip()]
+                                    for row in shape.table.rows) if cells]
+        if rows:
+            # Rows through the shared helper, between the same markers the Word reader
+            # writes, so a slide table reaches the splitter exactly as a Word table does:
+            # as rows, with a start and an end it can use to decide whether the table
+            # belongs to the text above it.
+            out.append(TABLE_MARKER)
+            for cells in rows:
                 counter[0] += 1
                 out.append(table_row(counter[0], cells))
+            out.append(TABLE_END_MARKER)
         return
     if shape.has_text_frame and shape.text_frame.text.strip():
         out.append(shape.text_frame.text)
@@ -301,7 +422,7 @@ def read_pptx(path: Path) -> Extracted:
     counter = [0]                       # running table-row number across the whole deck
     for index, slide in enumerate(prs.slides, start=1):
         parts.append(f"### SLIDE {index}")
-        for shape in slide.shapes:
+        for shape in _pptx_reading_order(slide.shapes):
             _pptx_shape_text(shape, parts, counter)
         if slide.has_notes_slide and slide.notes_slide.notes_text_frame.text.strip():
             # Speaker notes carry the instruction the slide only summarises often enough
@@ -310,10 +431,139 @@ def read_pptx(path: Path) -> Extracted:
     return Extracted(text=_clean("\n".join(parts)), pages=len(prs.slides), kind="pptx")
 
 
+# ====== HTML ======
+#
+# HTML arrives three ways: an .htm/.html file, the HTML part of an email, and the HTML body
+# of an Outlook message. All three go through `html_to_text`, which writes paragraphs as
+# lines and data tables between the same markers the Word reader uses — so the splitter
+# treats a table in an email exactly as it treats a table in a Word circular.
+
+_HTML_SKIP = {"script", "style", "head", "title", "meta", "noscript", "template", "xml"}
+_HTML_BLOCK = sorted({
+    "address", "article", "aside", "blockquote", "body", "br", "caption", "center", "dd",
+    "div", "dl", "dt", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr",
+    "html", "li", "main", "nav", "ol", "p", "pre", "section", "table", "tbody", "td",
+    "tfoot", "th", "thead", "tr", "ul"})
+
+
+def _is_layout_table(table) -> bool:
+    """A table holding another table is page LAYOUT, not data.
+
+    Outlook and most mail templates build the whole message out of nested tables. Read as
+    data, the entire body of such an email would land in one cell of one row.
+    """
+    return table.find("table") is not None
+
+
+def _html_cell_text(cell) -> str:
+    """A cell's text, one line per paragraph inside it — the same contract as a Word cell."""
+    lines: list[str] = []
+    _html_lines(cell, lines, [0])
+    return "\n".join(lines)
+
+
+def _html_table(table, out: list, counter: list) -> None:
+    """Write one data table as marked rows."""
+    rows = []
+    for tr in table.find_all("tr"):
+        cells = [_html_cell_text(cell) for cell in tr.find_all(["td", "th"], recursive=False)]
+        cells = [cell for cell in cells if cell]
+        if cells:
+            rows.append(cells)
+    if rows:
+        out.append(TABLE_MARKER)
+        for cells in rows:
+            counter[0] += 1
+            out.append(table_row(counter[0], cells))
+        out.append(TABLE_END_MARKER)
+
+
+def _html_lines(node, out: list, counter: list) -> None:
+    """Walk HTML in document order: one line per block of text, data tables as rows.
+
+    Inline markup — <b>, <span>, <a>, <font> — stays on the line it sits in. The regex
+    reader this replaced treated no tag as a boundary and kept the source's own line
+    breaks instead, which put a table's cells in a column of one-word lines between blank
+    lines — and the splitter dropped every one of them as too short to be a clause.
+    """
+    from bs4.element import NavigableString
+
+    inline: list[str] = []
+
+    def end_line() -> None:
+        text = " ".join(" ".join(inline).split())
+        if text:
+            out.append(text)
+        inline.clear()
+
+    for child in node.children:
+        name = getattr(child, "name", None)
+        if name is None:
+            # Real text only. Comments carry Outlook's conditional <!--[if mso]> blocks,
+            # which are markup, not message.
+            if type(child) is NavigableString:
+                inline.append(str(child))
+            continue
+        if name in _HTML_SKIP:
+            continue
+        if name not in _HTML_BLOCK and child.find(_HTML_BLOCK) is None:
+            inline.append(child.get_text(" "))
+            continue
+        end_line()
+        if name == "table" and not _is_layout_table(child):
+            _html_table(child, out, counter)
+        else:
+            _html_lines(child, out, counter)
+    end_line()
+
+
+def _has_data_table(raw: str) -> bool:
+    """True when the HTML holds a table that is data (two rows or more) rather than layout."""
+    try:
+        from bs4 import BeautifulSoup
+        return any(not _is_layout_table(table) and len(table.find_all("tr")) >= 2
+                   for table in BeautifulSoup(raw, "html.parser").find_all("table"))
+    except Exception:
+        return False
+
+
+def html_to_text(raw: str) -> str:
+    """Readable text from HTML: paragraphs as lines, data tables as marked rows.
+
+    Never raises. Without BeautifulSoup, or on markup it cannot walk, tags are stripped
+    instead — the table structure is lost but the words are not.
+    """
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(raw, "html.parser")
+        out: list[str] = []
+        _html_lines(soup.body or soup, out, [0])
+        return "\n".join(out)
+    except Exception:
+        raw = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw, flags=re.S | re.I)
+        return re.sub(r"<[^>]+>", " ", raw)
+
+
+# ====== EMAIL AND TEXT ======
+
+def _decode(payload: bytes, charset: str | None) -> str:
+    """Bytes to text with the part's declared charset, falling back to UTF-8 when the
+    declared one is missing or not a charset Python knows."""
+    try:
+        return payload.decode(charset or "utf-8", "replace")
+    except LookupError:
+        return payload.decode("utf-8", "replace")
+
+
 def read_msg(path: Path) -> Extracted:
     """Read an Outlook .msg: header, body and attachments. Attachments become children.
 
     Returns an error result if extract-msg is absent, rather than raising.
+
+    The body follows the same rule as `read_eml`: the HTML body is used when there is no
+    plain body, or when it holds a data table the plain rendering would flatten. This path
+    has NOT been run against a real .msg — none could be generated where it was written —
+    so check the first real Outlook circular through it.
     """
     try:
         import extract_msg
@@ -322,8 +572,18 @@ def read_msg(path: Path) -> Extracted:
                          kind="msg")
     message = extract_msg.Message(str(path))
     header = f"Subject: {message.subject}\nFrom: {message.sender}\nDate: {message.date}"
-    result = Extracted(text=_clean(header + "\n\n" + (message.body or "")), pages=1,
-                       kind="msg")
+    body = message.body or ""
+    try:
+        html = message.htmlBody
+    except Exception:
+        html = None
+    if isinstance(html, bytes):
+        html = _decode(html, None)
+    kind = "msg"
+    if html and (not body.strip() or _has_data_table(html)):
+        body = html_to_text(html)
+        kind = "msg-html"             # see read_eml: the splitter reads the two differently
+    result = Extracted(text=_clean(header + "\n\n" + body), pages=1, kind=kind)
     for attachment in message.attachments:
         name = attachment.longFilename or attachment.shortFilename or "attachment"
         if Path(name).suffix.lower() in SUPPORTED:
@@ -337,11 +597,14 @@ def read_msg(path: Path) -> Extracted:
 def read_text(path: Path) -> Extracted:
     """Read text, HTML, RTF or CSV, decoding with a fallback so an unusual encoding
     produces text rather than an exception.
+
+    HTML keeps its structure — paragraphs as lines, tables as marked rows — through
+    `html_to_text`. RTF normally goes through LibreOffice instead (`read_rtf`); the
+    control-word stripping below is only its fallback.
     """
     raw = path.read_text(encoding="utf-8", errors="replace")
     if path.suffix.lower() in {".htm", ".html"}:
-        raw = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw, flags=re.S | re.I)
-        raw = re.sub(r"<[^>]+>", " ", raw)
+        raw = html_to_text(raw)
     if path.suffix.lower() == ".rtf":
         raw = re.sub(r"\\[a-z]+-?\d*\s?|[{}]", " ", raw)
     return Extracted(text=_clean(raw), pages=1, kind=path.suffix.lstrip("."))
@@ -352,35 +615,51 @@ def read_eml(path: Path) -> Extracted:
 
     ABL confirmed RIA content arrives either in the body or attached, so both are read
     and the route is recorded on the document.
+
+    The body is the plain-text part, with two exceptions. A message with ONLY an HTML part
+    — the ordinary shape of an email written in a desktop mail client — used to have no
+    body at all: the circular arrived as its subject line and nothing else. And a message
+    whose HTML part holds a data table uses the HTML, because the plain rendering flattens
+    a table into run-on words the splitter cannot tell apart from prose.
     """
     import email
 
     message = email.message_from_bytes(path.read_bytes())
-    body = []
+    plain, html = [], []
     result = Extracted(pages=1, kind="eml")
     for part in message.walk():
-        if part.get_content_type() == "text/plain" and not part.get_filename():
+        name = part.get_filename()
+        content_type = part.get_content_type()
+        if content_type in ("text/plain", "text/html") and not name:
             payload = part.get_payload(decode=True)
             if payload:
-                body.append(payload.decode("utf-8", "replace"))
-        name = part.get_filename()
+                text = _decode(payload, part.get_content_charset())
+                (plain if content_type == "text/plain" else html).append(text)
         if name and Path(name).suffix.lower() in SUPPORTED:
             with tempfile.TemporaryDirectory() as tmp:
                 saved = Path(tmp) / name
                 saved.write_bytes(part.get_payload(decode=True) or b"")
                 result.children.append((name, read(saved, _depth=1)))
+
+    body = plain
+    if html and (not plain or any(_has_data_table(part) for part in html)):
+        body = [html_to_text(part) for part in html]
+        # Recorded, because it changes how the splitter reads the text: an HTML body has
+        # real paragraphs and marked tables, a plain one has neither.
+        result.kind = "eml-html"
     header = f"Subject: {message.get('Subject', '')}\nFrom: {message.get('From', '')}"
     result.text = _clean(header + "\n\n" + "\n".join(body))
     return result
 
 
-def read_legacy(path: Path) -> Extracted:
-    """.doc / .xls / .ppt — convert with LibreOffice, then read normally."""
+# ====== CONVERTED FORMATS ======
+
+def _read_converted(path: Path, target: str, kind: str) -> Extracted:
+    """Convert with LibreOffice to `target`, read the result, and label it `kind`."""
     soffice = find_soffice()
     if soffice is None:
-        return Extracted(error="LibreOffice is not installed — legacy "
-                               f"{path.suffix} cannot be converted", kind="legacy")
-    target = LEGACY[path.suffix.lower()]
+        return Extracted(error=f"LibreOffice is not installed — {path.suffix} cannot be "
+                               "converted", kind=kind)
     with tempfile.TemporaryDirectory() as tmp:
         try:
             subprocess.run(
@@ -388,14 +667,35 @@ def read_legacy(path: Path) -> Extracted:
                  "--outdir", tmp, str(path)],
                 capture_output=True, timeout=180, check=False)
         except Exception as exc:
-            return Extracted(error=f"LibreOffice conversion failed: {exc}", kind="legacy")
+            return Extracted(error=f"LibreOffice conversion failed: {exc}", kind=kind)
         converted = list(Path(tmp).glob("*" + target))
         if not converted:
             return Extracted(error="LibreOffice produced no output — the file may be "
-                                   "password-protected or corrupt", kind="legacy")
+                                   "password-protected or corrupt", kind=kind)
         result = read(converted[0], _depth=1)
-        result.kind = f"legacy{path.suffix}"
+        result.kind = kind
         return result
+
+
+def read_legacy(path: Path) -> Extracted:
+    """.doc / .xls / .ppt — convert with LibreOffice, then read normally."""
+    return _read_converted(path, LEGACY[path.suffix.lower()], f"legacy{path.suffix}")
+
+
+def read_rtf(path: Path) -> Extracted:
+    """RTF through LibreOffice to Word, then the Word reader — tables included.
+
+    RTF is markup, not text. Stripping its control words with a regex left the font table
+    and style sheet in the output — "Times New Roman; Symbol; Arial; ..." arrived as the
+    document's first clause — and turned every table into run-on words. LibreOffice
+    already converts .doc here, so RTF takes the same route. Only when LibreOffice is
+    missing does the old stripping run, and the kind says so.
+    """
+    if find_soffice() is None:
+        result = read_text(path)
+        result.kind = "rtf-stripped"
+        return result
+    return _read_converted(path, ".docx", "rtf")
 
 
 READERS = {
@@ -404,7 +704,7 @@ READERS = {
     ".pptx": read_pptx, ".msg": read_msg, ".eml": read_eml,
     ".doc": read_legacy, ".xls": read_legacy, ".ppt": read_legacy,
     ".txt": read_text, ".csv": read_text, ".htm": read_text,
-    ".html": read_text, ".rtf": read_text,
+    ".html": read_text, ".rtf": read_rtf,
     **{suffix: read_image for suffix in IMAGES},
 }
 
